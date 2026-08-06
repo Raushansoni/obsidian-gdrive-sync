@@ -15,3 +15,6 @@ export const BUNDLED_REDIRECT_URI =
   typeof __GDRIVE_REDIRECT_URI__ !== "undefined" && __GDRIVE_REDIRECT_URI__
     ? __GDRIVE_REDIRECT_URI__
     : "http://127.0.0.1:42813/";
+
+/** Prefer IPv4 loopback so desktop capture and mobile paste URLs stay consistent. */
+export const RECOMMENDED_REDIRECT_URI = "http://127.0.0.1:42813/";

@@ -85,6 +85,10 @@ export function applyBundledOAuthDefaults(settings: GDriveSyncSettings): void {
   if (!settings.redirectUri?.trim() && BUNDLED_REDIRECT_URI) {
     settings.redirectUri = BUNDLED_REDIRECT_URI;
   }
+  // Older builds used http://localhost:42813/ which can CONNECTION_REFUSED via IPv6.
+  if (/^http:\/\/localhost:42813\/?$/i.test(settings.redirectUri?.trim() || "")) {
+    settings.redirectUri = BUNDLED_REDIRECT_URI || "http://127.0.0.1:42813/";
+  }
 }
 
 export class GDriveSyncSettingTab extends PluginSettingTab {
@@ -194,7 +198,7 @@ export class GDriveSyncSettingTab extends PluginSettingTab {
     if (!connected || Platform.isMobile) {
       const authBox = containerEl.createDiv({ cls: "gdrive-sync-auth-box" });
       authBox.createEl("div", {
-        text: "Mobile / manual auth: after signing in, copy the full redirect URL (or just the code) and paste it here.",
+        text: "Mobile: after Google sign-in you may see Connection Refused / ERROR_CONNECTION_REFUSED — ignore it. Copy the full address-bar URL (has code=) or the code, paste below, then Submit.",
       });
       const area = authBox.createEl("textarea");
       area.placeholder = "http://127.0.0.1:42813/?code=...   or   4/0Afc...";

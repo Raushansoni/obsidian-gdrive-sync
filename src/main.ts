@@ -219,11 +219,18 @@ export default class GDriveSyncPlugin extends Plugin {
     }
 
     this.oauth.openBrowserAuth(config);
-    new Notice(
-      isLoopback
-        ? "Sign in, then paste the redirect URL (or code) in Google Drive Sync settings."
-        : "Sign in with Google. You will return to your site — Obsidian should open, or paste the code in settings."
-    );
+    if (Platform.isMobile && isLoopback) {
+      new Notice(
+        "After Google sign-in, the page may show Connection Refused — that is OK. Copy the full URL from the address bar (it contains code=…) and paste it under Submit auth code in settings.",
+        12000
+      );
+    } else {
+      new Notice(
+        isLoopback
+          ? "Sign in, then paste the redirect URL (or code) in Google Drive Sync settings."
+          : "Sign in with Google. You will return to your site — Obsidian should open, or paste the code in settings."
+      );
+    }
   }
 
   async completeManualAuth(raw: string): Promise<void> {

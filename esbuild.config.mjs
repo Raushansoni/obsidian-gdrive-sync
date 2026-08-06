@@ -37,7 +37,7 @@ const clientSecret =
 const redirectUri =
   process.env.GOOGLE_OAUTH_REDIRECT_URI ||
   process.env.OBSIDIAN_GDRIVE_REDIRECT_URI ||
-  "http://localhost:42813/";
+  "http://127.0.0.1:42813/";
 
 if (prod && clientId) {
   console.log(`[esbuild] Bundling OAuth Client ID into main.js (${clientId.slice(0, 12)}…)`);

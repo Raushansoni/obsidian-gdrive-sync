@@ -209,12 +209,27 @@ export class GoogleOAuth {
     );
   }
 
+  private loopbackListenTarget(redirectUri: string): { host: string; port: number; base: string } {
+    const u = new URL(redirectUri);
+    const port = u.port ? Number(u.port) : DESKTOP_REDIRECT_PORT;
+    // Prefer 127.0.0.1 for the socket — browsers hitting localhost may use IPv6 (::1)
+    // and get CONNECTION_REFUSED if we only bind IPv4 under the name "localhost".
+    const host = "127.0.0.1";
+    const base = `http://127.0.0.1:${port}`;
+    return { host, port, base };
+  }
+
   async connectDesktop(config: OAuthConfig): Promise<OAuthTokens> {
     if (!Platform.isDesktopApp) {
       throw new Error("Loopback OAuth is only available on desktop");
     }
 
-    const { authUrl, redirectUri, state } = this.beginAuth(config);
+    // Force IPv4 loopback for the desktop capture server (avoids localhost → ::1 refused).
+    const desktopConfig: OAuthConfig = {
+      ...config,
+      redirectUri: DESKTOP_REDIRECT_URI,
+    };
+    const { authUrl, redirectUri, state } = this.beginAuth(desktopConfig);
 
     // Web-client https redirects cannot be captured by a local server.
     if (!this.usesLoopback(redirectUri)) {
@@ -224,12 +239,14 @@ export class GoogleOAuth {
       );
     }
 
+    const { host, port, base } = this.loopbackListenTarget(redirectUri);
+
     const code = await new Promise<string>((resolve, reject) => {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const http = require("http") as typeof import("http");
       const server = http.createServer((req, res) => {
         try {
-          const url = new URL(req.url ?? "/", `http://127.0.0.1:${DESKTOP_REDIRECT_PORT}`);
+          const url = new URL(req.url ?? "/", `${base}/`);
           const err = url.searchParams.get("error");
           const codeParam = url.searchParams.get("code");
           const st = url.searchParams.get("state");
@@ -272,7 +289,7 @@ export class GoogleOAuth {
       };
       this.serverCloser = cleanup;
 
-      server.listen(DESKTOP_REDIRECT_PORT, "127.0.0.1", () => {
+      server.listen(port, host, () => {
         window.open(authUrl);
       });
       server.on("error", (e) => {
