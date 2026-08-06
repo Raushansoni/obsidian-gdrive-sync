@@ -38,10 +38,6 @@ const redirectUri =
   process.env.GOOGLE_OAUTH_REDIRECT_URI ||
   process.env.OBSIDIAN_GDRIVE_REDIRECT_URI ||
   "http://127.0.0.1:42813/";
-const mobileRedirectUri =
-  process.env.GOOGLE_OAUTH_MOBILE_REDIRECT_URI ||
-  process.env.OBSIDIAN_GDRIVE_MOBILE_REDIRECT_URI ||
-  "https://raushansoni.github.io/obsidian-gdrive-sync/oauth-callback.html";
 
 if (prod && clientId) {
   console.log(`[esbuild] Bundling OAuth Client ID into main.js (${clientId.slice(0, 12)}…)`);
@@ -81,7 +77,6 @@ const context = await esbuild.context({
     __GDRIVE_CLIENT_ID__: JSON.stringify(clientId),
     __GDRIVE_CLIENT_SECRET__: JSON.stringify(clientSecret),
     __GDRIVE_REDIRECT_URI__: JSON.stringify(redirectUri),
-    __GDRIVE_MOBILE_REDIRECT_URI__: JSON.stringify(mobileRedirectUri),
   },
 });
 

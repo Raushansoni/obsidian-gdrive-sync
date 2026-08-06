@@ -336,7 +336,7 @@ export class GoogleOAuth {
 
   /**
    * OAuth 2.0 device authorization (TV / limited-input).
-   * No redirect URI — avoids CONNECTION_REFUSED and Google blocking github.io Web clients.
+   * No redirect URI — used on mobile (and as desktop fallback).
    * Requires an OAuth client of type “TVs and Limited Input devices”.
    */
   async connectDeviceFlow(

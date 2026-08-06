@@ -80,25 +80,22 @@ npm run setup -- --rebuild
 
 Then: Connect Google → Remote folder name → Sync now.
 
-## Why mobile showed `CONNECTION_REFUSED` / Web client “Create failed”
+## Mobile auth (device code)
 
-1. **CONNECTION_REFUSED:** Google redirected to `http://127.0.0.1:42813/` — phones have nothing listening there.  
-2. **Web client Create failed:** Google often rejects `github.io` (and JS origins that include a path) as non-compliant domains.
+Phones cannot use the desktop loopback redirect (`http://127.0.0.1:42813/`). Mobile uses Google’s **device-code** login instead — no redirect URI and no hosted callback page.
 
-**Fix (v1.0.4+): Google device-code login on mobile** — no redirect URI at all.
-
-### Google Cloud — create a “TVs and Limited Input devices” client
+### Google Cloud — “TVs and Limited Input devices” client
 
 1. [Credentials](https://console.cloud.google.com/apis/credentials) → **Create OAuth client ID**  
 2. Application type: **TVs and Limited Input devices**  
 3. Name it (e.g. `Obsidian GDrive Sync`) → **Create**  
-4. Copy **Client ID** + **Client Secret** (no redirect URIs to fill — Create cannot fail for domain rules)  
+4. Copy **Client ID** + **Client Secret** (no redirect URIs)  
 5. Put them in GitHub secrets / `.env` and cut a release (or paste into plugin settings)  
 6. OAuth consent screen: **External** + **In production** so any Google account can approve
 
-Keep your old **Desktop** client for PC browser loopback if you want; mobile uses the TV/device client (or the same baked credentials if you only ship the TV client and use device flow everywhere).
+Keep a **Desktop** client for PC browser loopback if you want; mobile (and desktop fallback) uses the TV/device client.
 
-### Mobile auth (Android / iOS)
+### Connect on Android / iOS
 
 1. Update plugin to **1.0.4+** via BRAT  
 2. Tap **Connect Google**  
