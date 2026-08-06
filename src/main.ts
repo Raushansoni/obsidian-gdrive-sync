@@ -28,8 +28,14 @@ export default class GDriveSyncPlugin extends Plugin {
   private status: SyncStatus = "idle";
   private statusDetail = "";
   /** Live device-code auth UI (mobile). */
-  deviceAuth: { userCode: string; verificationUrl: string } | null = null;
+  deviceAuth: {
+    userCode: string;
+    verificationUrl: string;
+    phase: "waiting" | "checking";
+  } | null = null;
   private deviceAuthCancel = false;
+  /** Refresh open settings tab (set by GDriveSyncSettingTab). */
+  refreshSettingsTab: (() => void) | null = null;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -126,6 +132,15 @@ export default class GDriveSyncPlugin extends Plugin {
       if (this.settings.tokens?.refreshToken && this.settings.autoSync) {
         window.setTimeout(() => void this.syncNow(false), 2500);
       }
+    });
+
+    // Mobile: browser auth freezes timers; poll as soon as Obsidian is visible again.
+    this.registerDomEvent(document, "visibilitychange", () => {
+      if (document.visibilityState !== "visible") return;
+      if (!this.deviceAuth) return;
+      this.deviceAuth = { ...this.deviceAuth, phase: "checking" };
+      this.refreshSettingsTab?.();
+      this.oauth.wakeDevicePoll();
     });
 
     const platformHint = Platform.isMobile
@@ -260,13 +275,13 @@ export default class GDriveSyncPlugin extends Plugin {
           this.deviceAuth = {
             userCode: info.userCode,
             verificationUrl: info.verificationUrl,
+            phase: "waiting",
           };
           new Notice(
-            `Open ${info.verificationUrl} and enter code ${info.userCode}`,
-            15000
+            `Code ${info.userCode} — open google.com/device, Allow, then return here (no redirect).`,
+            20000
           );
-          // Refresh settings pane so the code is visible.
-          this.app.workspace.trigger("gdrive-sync-device-auth");
+          this.refreshSettingsTab?.();
           try {
             setting?.openTabById?.(this.manifest.id);
           } catch {
@@ -275,13 +290,25 @@ export default class GDriveSyncPlugin extends Plugin {
         },
         () => this.deviceAuthCancel
       );
+
+      // Mark connected in UI immediately — do not wait for first sync.
       this.deviceAuth = null;
       await this.applyTokens(tokens);
-      new Notice("Connected to Google Drive");
-      await this.ensureRemoteFolder();
-      await this.syncNow(false);
+      this.refreshSettingsTab?.();
+      new Notice("Connected to Google Drive ✓", 8000);
+
+      try {
+        await this.ensureRemoteFolder();
+        await this.syncNow(false);
+        new Notice("Vault sync finished", 5000);
+      } catch (syncErr) {
+        console.warn("[GDrive Sync] Connected but first sync failed", syncErr);
+        new Notice(`Connected, but sync failed: ${String(syncErr)}`, 12000);
+      }
+      this.refreshSettingsTab?.();
     } catch (e) {
       this.deviceAuth = null;
+      this.refreshSettingsTab?.();
       throw e;
     }
   }

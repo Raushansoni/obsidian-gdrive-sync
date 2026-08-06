@@ -189,9 +189,18 @@ export class GoogleOAuth {
   private pendingState: string | null = null;
   private pendingRedirectUri: string = DESKTOP_REDIRECT_URI;
   private serverCloser: (() => void) | null = null;
+  /** Resolve early from device-flow sleep (e.g. app returned to foreground). */
+  private devicePollWake: (() => void) | null = null;
 
   getRedirectUri(): string {
     return this.pendingRedirectUri;
+  }
+
+  /** Call when Obsidian becomes visible again during device-code login. */
+  wakeDevicePoll(): void {
+    const wake = this.devicePollWake;
+    this.devicePollWake = null;
+    wake?.();
   }
 
   getPendingState(): string | null {
@@ -385,15 +394,17 @@ export class GoogleOAuth {
 
     while (Date.now() < deadline) {
       if (shouldCancel?.()) throw new Error("Device auth cancelled");
-      await sleep(intervalMs);
+      await this.sleepInterruptible(intervalMs);
       if (shouldCancel?.()) throw new Error("Device auth cancelled");
 
       const pollBody = new URLSearchParams({
         client_id: config.clientId,
-        client_secret: config.clientSecret,
         device_code: data.device_code,
         grant_type: "urn:ietf:params:oauth:grant-type:device_code",
       });
+      if (config.clientSecret?.trim()) {
+        pollBody.set("client_secret", config.clientSecret.trim());
+      }
       const poll = await requestUrl({
         url: TOKEN_ENDPOINT,
         method: "POST",
@@ -401,14 +412,19 @@ export class GoogleOAuth {
         body: pollBody.toString(),
         throw: false,
       });
-      const json = poll.json as {
+      let json: {
         error?: string;
         access_token?: string;
         refresh_token?: string;
         expires_in?: number;
         token_type?: string;
         scope?: string;
-      };
+      } = {};
+      try {
+        json = (poll.json ?? {}) as typeof json;
+      } catch {
+        json = {};
+      }
 
       if (poll.status < 400 && json.access_token) {
         if (!json.refresh_token) {
@@ -432,9 +448,27 @@ export class GoogleOAuth {
       }
       if (json.error === "access_denied") throw new Error("Google access was denied");
       if (json.error === "expired_token") throw new Error("Device code expired — tap Connect again");
-      throw new Error(`Device auth failed: ${json.error || poll.text}`);
+      // Transient network / empty body while app was backgrounded — keep polling.
+      if (!json.error && poll.status >= 400) continue;
+      throw new Error(`Device auth failed: ${json.error || poll.text || `HTTP ${poll.status}`}`);
     }
     throw new Error("Device auth timed out — tap Connect again");
+  }
+
+  /** Sleep that can be cut short by wakeDevicePoll() when the app resumes. */
+  private sleepInterruptible(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        this.devicePollWake = null;
+        window.clearTimeout(timer);
+        resolve();
+      };
+      const timer = window.setTimeout(finish, ms);
+      this.devicePollWake = finish;
+    });
   }
 
   async completeWithCode(config: OAuthConfig, rawInput: string): Promise<OAuthTokens> {
@@ -457,6 +491,7 @@ export class GoogleOAuth {
       this.serverCloser();
       this.serverCloser = null;
     }
+    this.wakeDevicePoll();
   }
 }
 

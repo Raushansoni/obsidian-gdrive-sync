@@ -77,6 +77,31 @@ export const DEFAULT_SETTINGS: GDriveSyncSettings = {
   lastError: null,
 };
 
+async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* fall through */
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "true");
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Prefer build-time OAuth client. Official releases bake the TVs/Limited-Input client
  * required for mobile device-code auth. Stale Desktop client IDs in data.json cause
@@ -108,8 +133,20 @@ export class GDriveSyncSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
+  hide(): void {
+    if (this.plugin.refreshSettingsTab === this.redisplay) {
+      this.plugin.refreshSettingsTab = null;
+    }
+  }
+
+  private redisplay = (): void => {
+    // Only rebuild while this tab’s DOM is still mounted.
+    if (this.containerEl?.isConnected) this.display();
+  };
+
   display(): void {
     const { containerEl } = this;
+    this.plugin.refreshSettingsTab = this.redisplay;
     containerEl.empty();
     containerEl.addClass("gdrive-sync-settings");
 
@@ -168,28 +205,37 @@ export class GDriveSyncSettingTab extends PluginSettingTab {
       );
 
     const connected = !!this.plugin.settings.tokens?.refreshToken;
+    const statusEl = containerEl.createDiv({ cls: "gdrive-sync-conn-status" });
+    if (connected) {
+      statusEl.addClass("is-connected");
+      statusEl.setText("Status: Connected to Google Drive");
+    } else if (this.plugin.deviceAuth?.phase === "checking") {
+      statusEl.addClass("is-waiting");
+      statusEl.setText("Status: Checking Google approval… stay in Obsidian");
+    } else if (this.plugin.deviceAuth) {
+      statusEl.addClass("is-waiting");
+      statusEl.setText("Status: Waiting for you to Allow access in Google");
+    } else {
+      statusEl.setText("Status: Not connected");
+    }
+
     new Setting(containerEl)
       .setName("Google account")
       .setDesc(
         connected
-          ? "Connected. Use the same account on every device."
+          ? "Connected. Use the same Google account on every device."
           : Platform.isMobile
-            ? "Mobile uses Google device login (no localhost). Tap Connect, then enter the code at google.com/device."
+            ? "Tap Connect → enter the code at google.com/device → Allow → return to Obsidian. There is no redirect."
             : "Desktop opens the browser automatically; falls back to device code if needed."
       )
       .addButton((btn) =>
         btn
           .setButtonText(connected ? "Reconnect" : "Connect Google")
           .setCta()
+          .setDisabled(!!this.plugin.deviceAuth && !connected)
           .onClick(async () => {
             try {
-              // Refresh UI while device-code polling runs.
-              const refresh = window.setInterval(() => {
-                if (this.plugin.deviceAuth) this.display();
-                else window.clearInterval(refresh);
-              }, 800);
               await this.plugin.connectGoogle();
-              window.clearInterval(refresh);
               this.display();
             } catch (e) {
               new Notice(`Connect failed: ${String(e)}`, 12000);
@@ -209,20 +255,58 @@ export class GDriveSyncSettingTab extends PluginSettingTab {
       );
 
     if (this.plugin.deviceAuth) {
+      const userCode = this.plugin.deviceAuth.userCode;
       const box = containerEl.createDiv({ cls: "gdrive-sync-auth-box" });
-      box.createEl("h3", { text: "Finish Google sign-in" });
-      box.createEl("p", {
-        text: `1. Open ${this.plugin.deviceAuth.verificationUrl}`,
+      box.createEl("h3", {
+        text:
+          this.plugin.deviceAuth.phase === "checking"
+            ? "Almost done — confirming…"
+            : "Finish Google sign-in",
       });
       box.createEl("p", {
-        text: `2. Enter this code: ${this.plugin.deviceAuth.userCode}`,
+        text: "1. Tap the code below to copy it",
+      });
+      const codeBtn = box.createEl("button", {
+        cls: "gdrive-sync-code-copy",
+        text: userCode,
+        attr: { type: "button", "aria-label": "Copy device code" },
+      });
+      codeBtn.addEventListener("click", async () => {
+        const ok = await copyText(userCode);
+        new Notice(ok ? `Copied ${userCode}` : "Could not copy — long-press the code", 4000);
       });
       box.createEl("p", {
-        text: "3. Allow Drive access — Obsidian will connect automatically.",
+        text: "2. Open google.com/device, paste the code, tap Allow, then return here (no redirect).",
       });
+      new Setting(box)
+        .addButton((btn) =>
+          btn.setButtonText("Copy code").onClick(async () => {
+            const ok = await copyText(userCode);
+            new Notice(ok ? `Copied ${userCode}` : "Could not copy — long-press the code", 4000);
+          })
+        )
+        .addButton((btn) =>
+          btn.setButtonText("Open google.com/device").setCta().onClick(() => {
+            if (this.plugin.deviceAuth) {
+              this.plugin.deviceAuth = {
+                ...this.plugin.deviceAuth,
+                phase: "waiting",
+              };
+            }
+            window.open(this.plugin.deviceAuth!.verificationUrl);
+          })
+        );
       new Setting(box).addButton((btn) =>
-        btn.setButtonText("Open google.com/device").setCta().onClick(() => {
-          window.open(this.plugin.deviceAuth!.verificationUrl);
+        btn.setButtonText("I allowed access — check now").onClick(() => {
+          if (this.plugin.deviceAuth) {
+            this.plugin.deviceAuth = {
+              ...this.plugin.deviceAuth,
+              phase: "checking",
+            };
+            this.display();
+          }
+          this.plugin.oauth.wakeDevicePoll();
+          new Notice("Checking Google…", 4000);
         })
       );
     }

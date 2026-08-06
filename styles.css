@@ -14,12 +14,51 @@
   font-size: 0.85em;
 }
 
+.gdrive-sync-conn-status {
+  margin: 0.75em 0 1em;
+  padding: 0.65em 0.85em;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  font-weight: 600;
+}
+
+.gdrive-sync-conn-status.is-connected {
+  color: var(--text-success, var(--text-accent));
+  border-color: var(--text-success, var(--text-accent));
+}
+
+.gdrive-sync-conn-status.is-waiting {
+  color: var(--text-accent);
+}
+
 .gdrive-sync-auth-box {
   margin-top: 0.5em;
   padding: 0.75em;
   border: 1px solid var(--background-modifier-border);
   border-radius: 6px;
   background: var(--background-secondary);
+}
+
+.gdrive-sync-code-copy {
+  display: block;
+  width: 100%;
+  margin: 0.5em 0 0.75em;
+  padding: 0.85em 0.75em;
+  border: 1px dashed var(--text-accent);
+  border-radius: 8px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: 1.45em;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-align: center;
+  cursor: pointer;
+}
+
+.gdrive-sync-code-copy:active {
+  background: var(--background-modifier-hover);
 }
 
 .gdrive-sync-auth-box textarea {
