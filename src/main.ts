@@ -158,11 +158,21 @@ export default class GDriveSyncPlugin extends Plugin {
   }
 
   private oauthConfig() {
+    const desktop = this.settings.redirectUri || DESKTOP_REDIRECT_URI;
+    const mobile =
+      this.settings.mobileRedirectUri?.trim() ||
+      "https://raushansoni.github.io/obsidian-gdrive-sync/oauth-callback.html";
     return {
       clientId: this.settings.clientId,
       clientSecret: this.settings.clientSecret,
-      redirectUri: this.settings.redirectUri || DESKTOP_REDIRECT_URI,
+      // Loopback on phones always yields CONNECTION_REFUSED — use HTTPS callback instead.
+      redirectUri: Platform.isMobile ? mobile : desktop,
     };
+  }
+
+  private async rememberOAuthRedirect(redirectUri: string): Promise<void> {
+    this.settings.pendingOAuthRedirectUri = redirectUri;
+    await this.saveSettings();
   }
 
   private initDrive(): void {
@@ -187,7 +197,6 @@ export default class GDriveSyncPlugin extends Plugin {
     if (!this.settings.clientId?.trim()) {
       new Notice("Add your Google OAuth Client ID in settings first");
       try {
-        // Open plugin settings so the field is visible on mobile.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const setting = (this.app as any).setting;
         setting?.open?.();
@@ -204,45 +213,54 @@ export default class GDriveSyncPlugin extends Plugin {
     if (Platform.isDesktopApp && isLoopback) {
       new Notice("Complete Google sign-in in your browser…");
       try {
+        await this.rememberOAuthRedirect(DESKTOP_REDIRECT_URI);
         const tokens = await this.oauth.connectDesktop(config);
+        this.settings.pendingOAuthRedirectUri = "";
         await this.applyTokens(tokens);
         new Notice("Connected to Google Drive");
         await this.ensureRemoteFolder();
         await this.syncNow(false);
         return;
       } catch (e) {
-        console.warn("[GDrive Sync] Desktop OAuth failed, opening manual flow", e);
+        // Opening the browser again without a loopback server causes CONNECTION_REFUSED.
+        console.warn("[GDrive Sync] Desktop OAuth failed", e);
         new Notice(
-          "Automatic capture failed. Browser opened — paste the redirect URL in settings if needed."
+          `Connect failed: ${String(e)}. If you have a code URL, paste it under Submit auth code.`,
+          10000
         );
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const setting = (this.app as any).setting;
+          setting?.open?.();
+          setting?.openTabById?.(this.manifest.id);
+        } catch {
+          /* ignore */
+        }
+        return;
       }
     }
 
-    this.oauth.openBrowserAuth(config);
-    if (Platform.isMobile && isLoopback) {
-      new Notice(
-        "After Google sign-in, the page may show Connection Refused — that is OK. Copy the full URL from the address bar (it contains code=…) and paste it under Submit auth code in settings.",
-        12000
-      );
-    } else {
-      new Notice(
-        isLoopback
-          ? "Sign in, then paste the redirect URL (or code) in Google Drive Sync settings."
-          : "Sign in with Google. You will return to your site — Obsidian should open, or paste the code in settings."
-      );
-    }
+    const { redirectUri } = this.oauth.openBrowserAuth(config);
+    await this.rememberOAuthRedirect(redirectUri);
+    new Notice(
+      Platform.isMobile
+        ? "Sign in with Google. You should return through the callback page into Obsidian."
+        : "Sign in with Google, then return to Obsidian.",
+      10000
+    );
   }
 
   async completeManualAuth(raw: string): Promise<void> {
     if (!this.settings.clientId) {
       throw new Error("Missing Client ID");
     }
-    const config = this.oauthConfig();
-    // Ensure pending redirect matches what Google used
-    if (!this.oauth.getPendingState()) {
-      this.oauth.beginAuth(config);
-    }
+    applyBundledOAuthDefaults(this.settings);
+    const redirectUri =
+      this.settings.pendingOAuthRedirectUri?.trim() || this.oauthConfig().redirectUri;
+    const config = { ...this.oauthConfig(), redirectUri };
+    this.oauth.setPendingRedirectUri(redirectUri);
     const tokens = await this.oauth.completeWithCode(config, raw);
+    this.settings.pendingOAuthRedirectUri = "";
     await this.applyTokens(tokens);
     await this.ensureRemoteFolder();
     new Notice("Connected to Google Drive");

@@ -4,6 +4,7 @@ import {
   BUNDLED_CLIENT_ID,
   BUNDLED_CLIENT_SECRET,
   BUNDLED_REDIRECT_URI,
+  BUNDLED_MOBILE_REDIRECT_URI,
 } from "./bundled-oauth";
 
 export interface TokenSet {
@@ -32,8 +33,12 @@ export interface SyncIndex {
 export interface GDriveSyncSettings {
   clientId: string;
   clientSecret: string;
-  /** Must match an Authorized redirect URI on the Google OAuth client. */
+  /** Desktop loopback redirect — must match an Authorized redirect URI. */
   redirectUri: string;
+  /** HTTPS callback for mobile (GitHub Pages). Required — loopback always CONNECTION_REFUSED on phones. */
+  mobileRedirectUri: string;
+  /** Persisted across app switches so token exchange uses the same redirect_uri. */
+  pendingOAuthRedirectUri: string;
   tokens: TokenSet | null;
   remoteFolderName: string;
   remoteFolderId: string;
@@ -63,6 +68,8 @@ export const DEFAULT_SETTINGS: GDriveSyncSettings = {
   clientId: BUNDLED_CLIENT_ID,
   clientSecret: BUNDLED_CLIENT_SECRET,
   redirectUri: BUNDLED_REDIRECT_URI,
+  mobileRedirectUri: BUNDLED_MOBILE_REDIRECT_URI,
+  pendingOAuthRedirectUri: "",
   tokens: null,
   remoteFolderName: "",
   remoteFolderId: "",
@@ -84,6 +91,9 @@ export function applyBundledOAuthDefaults(settings: GDriveSyncSettings): void {
   }
   if (!settings.redirectUri?.trim() && BUNDLED_REDIRECT_URI) {
     settings.redirectUri = BUNDLED_REDIRECT_URI;
+  }
+  if (!settings.mobileRedirectUri?.trim() && BUNDLED_MOBILE_REDIRECT_URI) {
+    settings.mobileRedirectUri = BUNDLED_MOBILE_REDIRECT_URI;
   }
   // Older builds used http://localhost:42813/ which can CONNECTION_REFUSED via IPv6.
   if (/^http:\/\/localhost:42813\/?$/i.test(settings.redirectUri?.trim() || "")) {
@@ -147,16 +157,29 @@ export class GDriveSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("OAuth redirect URI")
-      .setDesc(
-        "Must exactly match a redirect URI on your Google OAuth client (Web clients usually use an https URL)."
-      )
+      .setName("Desktop redirect URI")
+      .setDesc("Loopback for PC/Mac. Must be allowed on your Google OAuth client.")
       .addText((text) =>
         text
-          .setPlaceholder("https://your-app.vercel.app/")
+          .setPlaceholder("http://127.0.0.1:42813/")
           .setValue(this.plugin.settings.redirectUri)
           .onChange(async (value) => {
             this.plugin.settings.redirectUri = value.trim();
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Mobile redirect URI")
+      .setDesc(
+        "HTTPS callback page (not localhost). Localhost on phones always shows CONNECTION_REFUSED."
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("https://raushansoni.github.io/obsidian-gdrive-sync/oauth-callback.html")
+          .setValue(this.plugin.settings.mobileRedirectUri)
+          .onChange(async (value) => {
+            this.plugin.settings.mobileRedirectUri = value.trim();
             await this.plugin.saveSettings();
           })
       );
@@ -198,7 +221,7 @@ export class GDriveSyncSettingTab extends PluginSettingTab {
     if (!connected || Platform.isMobile) {
       const authBox = containerEl.createDiv({ cls: "gdrive-sync-auth-box" });
       authBox.createEl("div", {
-        text: "Mobile: after Google sign-in you may see Connection Refused / ERROR_CONNECTION_REFUSED — ignore it. Copy the full address-bar URL (has code=) or the code, paste below, then Submit.",
+        text: "If the HTTPS callback opened Obsidian automatically, you’re done. Otherwise paste the code from the callback page (or any URL with code=) here and Submit.",
       });
       const area = authBox.createEl("textarea");
       area.placeholder = "http://127.0.0.1:42813/?code=...   or   4/0Afc...";

@@ -194,6 +194,15 @@ export class GoogleOAuth {
     return this.pendingState;
   }
 
+  getPendingRedirectUri(): string {
+    return this.pendingRedirectUri;
+  }
+
+  /** Restore redirect used for an in-flight auth (needed after mobile app switch). */
+  setPendingRedirectUri(redirectUri: string): void {
+    this.pendingRedirectUri = redirectUri.trim() || DESKTOP_REDIRECT_URI;
+  }
+
   beginAuth(config: OAuthConfig): { authUrl: string; redirectUri: string; state: string } {
     this.cancelPending();
     this.pendingState = randomState();
@@ -323,7 +332,9 @@ export class GoogleOAuth {
 
   async completeWithCode(config: OAuthConfig, rawInput: string): Promise<OAuthTokens> {
     const code = extractCodeFromInput(rawInput);
-    const redirectUri = this.pendingRedirectUri || DESKTOP_REDIRECT_URI;
+    const redirectUri =
+      (config.redirectUri || "").trim() || this.pendingRedirectUri || DESKTOP_REDIRECT_URI;
+    this.pendingRedirectUri = redirectUri;
     const tokens = await exchangeCode(config, code, redirectUri);
     if (!tokens.refreshToken) {
       throw new Error(

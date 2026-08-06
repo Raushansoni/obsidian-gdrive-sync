@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Google Drive Sync — Authorization</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+      }
+      body {
+        max-width: 36rem;
+        margin: 2rem auto;
+        padding: 0 1.25rem;
+        line-height: 1.45;
+      }
+      code {
+        word-break: break-all;
+        font-size: 0.9rem;
+      }
+      a.button {
+        display: inline-block;
+        margin: 0.75rem 0;
+        padding: 0.7rem 1rem;
+        border-radius: 8px;
+        background: #6d28d9;
+        color: #fff;
+        text-decoration: none;
+        font-weight: 600;
+      }
+      .err {
+        color: #b91c1c;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Google Drive Sync</h1>
+    <div id="msg">Completing sign-in…</div>
+    <script>
+      (function () {
+        var params = new URLSearchParams(window.location.search);
+        var err = params.get("error");
+        var code = params.get("code");
+        var state = params.get("state");
+        var el = document.getElementById("msg");
+
+        if (err) {
+          el.className = "err";
+          el.textContent = "Google authorization failed: " + err;
+          return;
+        }
+
+        if (!code) {
+          el.className = "err";
+          el.textContent =
+            "No authorization code found. Close this page and tap Connect Google again in Obsidian.";
+          return;
+        }
+
+        var deep =
+          "obsidian://gdrive-sync?code=" +
+          encodeURIComponent(code) +
+          (state ? "&state=" + encodeURIComponent(state) : "");
+
+        el.innerHTML =
+          "<p><strong>Success.</strong> Return to Obsidian to finish connecting.</p>" +
+          '<p><a class="button" id="open" href="' +
+          deep +
+          '">Open Obsidian</a></p>' +
+          "<p>If Obsidian does not open, copy this code into the plugin’s <em>Submit auth code</em> box:</p>" +
+          "<p><code id=" +
+          "code" +
+          "></code></p>";
+
+        document.getElementById("code").textContent = code;
+
+        // Auto-jump back into Obsidian (mobile + desktop).
+        window.location.href = deep;
+      })();
+    </script>
+  </body>
+</html>

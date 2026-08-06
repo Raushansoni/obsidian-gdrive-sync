@@ -80,15 +80,29 @@ npm run setup -- --rebuild
 
 Then: Connect Google → Remote folder name → Sync now.
 
-## Mobile auth (Android / iOS)
+## Why mobile showed `CONNECTION_REFUSED` (root cause)
 
-1. Tap **Connect Google** — the system browser opens.
-2. Sign in and approve Drive access.
-3. The browser may fail to open `http://127.0.0.1:42813/` — expected on mobile.
-4. Copy the **full URL** from the address bar (`?code=...`), or just the `code`.
-5. Paste it into **Submit auth code** in plugin settings.
+Google was told to redirect to `http://127.0.0.1:42813/`. On a phone **nothing listens** on that address, so the browser always reports connection refused. That is not a Drive/API outage — loopback OAuth cannot finish inside a mobile browser.
 
-Or open: `obsidian://gdrive-sync?code=YOUR_CODE`
+**Fix (v1.0.3+):** mobile uses an HTTPS callback page, then `obsidian://gdrive-sync?code=…`.
+
+### Google Cloud — use a Web application OAuth client
+
+Your old **Desktop** client only allows localhost. For phones, create (or switch to) **Web application**:
+
+1. Google Cloud → **Credentials → Create OAuth client ID → Web application**
+2. Authorized redirect URIs — add **both**:
+   - `http://127.0.0.1:42813/`
+   - `https://raushansoni.github.io/obsidian-gdrive-sync/oauth-callback.html`
+3. Copy Client ID + Secret into GitHub Actions secrets / local `.env`, cut a new release
+4. OAuth consent screen: **External** + **In production** (so any Google account can sign in)
+
+### Mobile auth (Android / iOS)
+
+1. Update plugin to **1.0.3+** via BRAT  
+2. Tap **Connect Google** → sign in  
+3. You should land on the GitHub Pages callback → **Open Obsidian** (or it auto-opens)  
+4. Set remote folder name → **Sync now**
 
 ## Commands
 
