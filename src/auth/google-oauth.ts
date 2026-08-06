@@ -347,16 +347,17 @@ export class GoogleOAuth {
    * OAuth 2.0 device authorization (TV / limited-input).
    * No redirect URI — used on mobile (and as desktop fallback).
    * Requires an OAuth client of type “TVs and Limited Input devices”.
+   *
+   * Split into start + poll so the device_code can be persisted across
+   * mobile WebView pauses (Google can show “connected” while Obsidian was asleep).
    */
-  async connectDeviceFlow(
-    config: OAuthConfig,
-    onUserCode: (info: {
-      userCode: string;
-      verificationUrl: string;
-      expiresIn: number;
-    }) => void,
-    shouldCancel?: () => boolean
-  ): Promise<OAuthTokens> {
+  async startDeviceAuth(config: OAuthConfig): Promise<{
+    deviceCode: string;
+    userCode: string;
+    verificationUrl: string;
+    expiresIn: number;
+    intervalMs: number;
+  }> {
     const body = new URLSearchParams({
       client_id: config.clientId,
       scope: DEVICE_SCOPES,
@@ -368,95 +369,174 @@ export class GoogleOAuth {
       body: body.toString(),
       throw: false,
     });
-    if (start.status >= 400) {
+    const startJson = parseJsonBody<{
+      error?: string;
+      error_description?: string;
+      device_code?: string;
+      user_code?: string;
+      verification_url?: string;
+      verification_uri?: string;
+      expires_in?: number;
+      interval?: number;
+    }>(start);
+
+    if (start.status >= 400 || startJson.error || !startJson.device_code || !startJson.user_code) {
       throw new Error(
-        `Device auth start failed (${start.status}): ${start.text}. ` +
-          `Create an OAuth client type “TVs and Limited Input devices” (no redirect URIs).`
+        `Device auth start failed (${start.status}): ${
+          startJson.error_description || startJson.error || start.text || "unknown"
+        }. Create an OAuth client type “TVs and Limited Input devices” (no redirect URIs).`
       );
     }
-    const data = start.json as {
-      device_code: string;
-      user_code: string;
-      verification_url: string;
-      verification_uri?: string;
-      expires_in: number;
-      interval?: number;
+
+    return {
+      deviceCode: startJson.device_code,
+      userCode: startJson.user_code,
+      verificationUrl:
+        startJson.verification_uri ||
+        startJson.verification_url ||
+        "https://www.google.com/device",
+      expiresIn: startJson.expires_in ?? 1800,
+      intervalMs: Math.max(5, startJson.interval ?? 5) * 1000,
     };
-    const verificationUrl = data.verification_uri || data.verification_url || "https://www.google.com/device";
-    onUserCode({
-      userCode: data.user_code,
-      verificationUrl,
-      expiresIn: data.expires_in,
+  }
+
+  /**
+   * One token poll. Call repeatedly until tokens / error / pending.
+   * client_secret is required by Google for the device token endpoint.
+   */
+  async pollDeviceAuthOnce(
+    config: OAuthConfig,
+    deviceCode: string
+  ): Promise<
+    | { kind: "pending" }
+    | { kind: "slow_down" }
+    | { kind: "tokens"; tokens: OAuthTokens }
+    | { kind: "error"; message: string }
+  > {
+    if (!config.clientSecret?.trim()) {
+      return {
+        kind: "error",
+        message:
+          "Missing OAuth client secret. Device login needs the TVs/Limited-Input client secret.",
+      };
+    }
+
+    const pollBody = new URLSearchParams({
+      client_id: config.clientId,
+      client_secret: config.clientSecret.trim(),
+      device_code: deviceCode,
+      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
     });
+    const poll = await requestUrl({
+      url: TOKEN_ENDPOINT,
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: pollBody.toString(),
+      throw: false,
+    });
+    const json = parseJsonBody<{
+      error?: string;
+      error_description?: string;
+      access_token?: string;
+      refresh_token?: string;
+      expires_in?: number;
+      token_type?: string;
+      scope?: string;
+    }>(poll);
 
-    let intervalMs = Math.max(5, data.interval ?? 5) * 1000;
-    const deadline = Date.now() + data.expires_in * 1000;
-
-    while (Date.now() < deadline) {
-      if (shouldCancel?.()) throw new Error("Device auth cancelled");
-      await this.sleepInterruptible(intervalMs);
-      if (shouldCancel?.()) throw new Error("Device auth cancelled");
-
-      const pollBody = new URLSearchParams({
-        client_id: config.clientId,
-        device_code: data.device_code,
-        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-      });
-      if (config.clientSecret?.trim()) {
-        pollBody.set("client_secret", config.clientSecret.trim());
-      }
-      const poll = await requestUrl({
-        url: TOKEN_ENDPOINT,
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: pollBody.toString(),
-        throw: false,
-      });
-      let json: {
-        error?: string;
-        access_token?: string;
-        refresh_token?: string;
-        expires_in?: number;
-        token_type?: string;
-        scope?: string;
-      } = {};
-      try {
-        json = (poll.json ?? {}) as typeof json;
-      } catch {
-        json = {};
-      }
-
-      if (poll.status < 400 && json.access_token) {
-        if (!json.refresh_token) {
-          throw new Error(
-            "No refresh token from device flow. Revoke app access at Google Account permissions and retry."
-          );
-        }
+    if (poll.status < 400 && json.access_token) {
+      if (!json.refresh_token) {
         return {
+          kind: "error",
+          message:
+            "Google authorized, but no refresh token was returned. Revoke this app at https://myaccount.google.com/permissions then Connect again.",
+        };
+      }
+      return {
+        kind: "tokens",
+        tokens: {
           accessToken: json.access_token,
           refreshToken: json.refresh_token,
           expiresAt: Date.now() + (json.expires_in ?? 3600) * 1000,
           tokenType: json.token_type ?? "Bearer",
           scope: json.scope,
-        };
-      }
+        },
+      };
+    }
 
-      if (json.error === "authorization_pending") continue;
-      if (json.error === "slow_down") {
+    if (json.error === "authorization_pending") return { kind: "pending" };
+    if (json.error === "slow_down") return { kind: "slow_down" };
+    if (json.error === "access_denied") {
+      return { kind: "error", message: "Google access was denied" };
+    }
+    if (json.error === "expired_token") {
+      return { kind: "error", message: "Device code expired — tap Connect again" };
+    }
+
+    // Empty / network blip while app was backgrounded — treat as still pending.
+    if (!json.error && (poll.status === 0 || poll.status >= 500 || !poll.text)) {
+      return { kind: "pending" };
+    }
+
+    return {
+      kind: "error",
+      message: `Device auth failed: ${
+        json.error_description || json.error || poll.text || `HTTP ${poll.status}`
+      }`,
+    };
+  }
+
+  async connectDeviceFlow(
+    config: OAuthConfig,
+    onUserCode: (info: {
+      userCode: string;
+      verificationUrl: string;
+      expiresIn: number;
+    }) => void,
+    shouldCancel?: () => boolean,
+    onStarted?: (pending: {
+      deviceCode: string;
+      userCode: string;
+      verificationUrl: string;
+      expiresAt: number;
+      intervalMs: number;
+    }) => void | Promise<void>
+  ): Promise<OAuthTokens> {
+    const started = await this.startDeviceAuth(config);
+    const expiresAt = Date.now() + started.expiresIn * 1000;
+    onUserCode({
+      userCode: started.userCode,
+      verificationUrl: started.verificationUrl,
+      expiresIn: started.expiresIn,
+    });
+    await onStarted?.({
+      deviceCode: started.deviceCode,
+      userCode: started.userCode,
+      verificationUrl: started.verificationUrl,
+      expiresAt,
+      intervalMs: started.intervalMs,
+    });
+
+    let intervalMs = started.intervalMs;
+    while (Date.now() < expiresAt) {
+      if (shouldCancel?.()) throw new Error("Device auth cancelled");
+      await this.sleepInterruptible(intervalMs);
+      if (shouldCancel?.()) throw new Error("Device auth cancelled");
+
+      const result = await this.pollDeviceAuthOnce(config, started.deviceCode);
+      if (result.kind === "tokens") return result.tokens;
+      if (result.kind === "pending") continue;
+      if (result.kind === "slow_down") {
         intervalMs += 5000;
         continue;
       }
-      if (json.error === "access_denied") throw new Error("Google access was denied");
-      if (json.error === "expired_token") throw new Error("Device code expired — tap Connect again");
-      // Transient network / empty body while app was backgrounded — keep polling.
-      if (!json.error && poll.status >= 400) continue;
-      throw new Error(`Device auth failed: ${json.error || poll.text || `HTTP ${poll.status}`}`);
+      throw new Error(result.message);
     }
-    throw new Error("Device auth timed out — tap Connect again");
+    throw new Error("Device auth timed out — return to Obsidian and tap Connect again");
   }
 
   /** Sleep that can be cut short by wakeDevicePoll() when the app resumes. */
-  private sleepInterruptible(ms: number): Promise<void> {
+  sleepInterruptible(ms: number): Promise<void> {
     return new Promise((resolve) => {
       let done = false;
       const finish = () => {
@@ -497,4 +577,19 @@ export class GoogleOAuth {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Obsidian mobile sometimes leaves requestUrl.json empty; parse text as fallback. */
+function parseJsonBody<T extends object>(res: { json?: unknown; text?: string }): T {
+  const fromJson = res.json;
+  if (fromJson && typeof fromJson === "object" && Object.keys(fromJson as object).length > 0) {
+    return fromJson as T;
+  }
+  const text = (res.text || "").trim();
+  if (!text) return {} as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return {} as T;
+  }
 }

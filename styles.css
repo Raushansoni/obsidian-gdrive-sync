@@ -28,8 +28,14 @@
   border-color: var(--text-success, var(--text-accent));
 }
 
-.gdrive-sync-conn-status.is-waiting {
-  color: var(--text-accent);
+.gdrive-sync-auth-error {
+  margin: 0 0 1em;
+  padding: 0.65em 0.85em;
+  border-radius: 6px;
+  border: 1px solid var(--text-error);
+  color: var(--text-error);
+  background: var(--background-secondary);
+  font-size: 0.9em;
 }
 
 .gdrive-sync-auth-box {

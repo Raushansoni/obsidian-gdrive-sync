@@ -34,6 +34,7 @@ export default class GDriveSyncPlugin extends Plugin {
     phase: "waiting" | "checking";
   } | null = null;
   private deviceAuthCancel = false;
+  private deviceAuthResuming = false;
   /** Refresh open settings tab (set by GDriveSyncSettingTab). */
   refreshSettingsTab: (() => void) | null = null;
 
@@ -132,15 +133,17 @@ export default class GDriveSyncPlugin extends Plugin {
       if (this.settings.tokens?.refreshToken && this.settings.autoSync) {
         window.setTimeout(() => void this.syncNow(false), 2500);
       }
+      // Resume device login after mobile WebView kill/reload.
+      window.setTimeout(() => void this.resumePendingDeviceAuth("startup"), 800);
     });
 
     // Mobile: browser auth freezes timers; poll as soon as Obsidian is visible again.
     this.registerDomEvent(document, "visibilitychange", () => {
       if (document.visibilityState !== "visible") return;
-      if (!this.deviceAuth) return;
-      this.deviceAuth = { ...this.deviceAuth, phase: "checking" };
-      this.refreshSettingsTab?.();
-      this.oauth.wakeDevicePoll();
+      void this.resumePendingDeviceAuth("visible");
+    });
+    this.registerDomEvent(window, "focus", () => {
+      void this.resumePendingDeviceAuth("focus");
     });
 
     const platformHint = Platform.isMobile
@@ -230,6 +233,18 @@ export default class GDriveSyncPlugin extends Plugin {
     // Mobile: device-code flow (no localhost redirect → no CONNECTION_REFUSED).
     // Requires OAuth client type “TVs and Limited Input devices”.
     if (Platform.isMobile) {
+      const pending = this.settings.pendingDeviceAuth;
+      if (
+        pending &&
+        Date.now() < pending.expiresAt &&
+        !this.settings.tokens?.refreshToken
+      ) {
+        new Notice("Finishing previous Google login…", 5000);
+        const ok = await this.resumePendingDeviceAuth("check-now");
+        if (ok || this.settings.tokens?.refreshToken) return;
+        // Hard failure clears pending; otherwise keep waiting on existing code.
+        if (this.settings.pendingDeviceAuth) return;
+      }
       await this.connectWithDeviceFlow(config);
       return;
     }
@@ -263,6 +278,7 @@ export default class GDriveSyncPlugin extends Plugin {
     redirectUri: string;
   }): Promise<void> {
     this.deviceAuthCancel = false;
+    this.settings.lastAuthError = null;
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const setting = (this.app as any).setting;
@@ -278,7 +294,7 @@ export default class GDriveSyncPlugin extends Plugin {
             phase: "waiting",
           };
           new Notice(
-            `Code ${info.userCode} — open google.com/device, Allow, then return here (no redirect).`,
+            `Code ${info.userCode} — Allow on Google, then return here. Google will not redirect back.`,
             20000
           );
           this.refreshSettingsTab?.();
@@ -288,29 +304,143 @@ export default class GDriveSyncPlugin extends Plugin {
             /* ignore */
           }
         },
-        () => this.deviceAuthCancel
+        () => this.deviceAuthCancel,
+        async (pending) => {
+          // Persist device_code so we can finish after WebView pause/kill.
+          this.settings.pendingDeviceAuth = pending;
+          await this.saveSettings();
+        }
       );
 
-      // Mark connected in UI immediately — do not wait for first sync.
-      this.deviceAuth = null;
-      await this.applyTokens(tokens);
-      this.refreshSettingsTab?.();
-      new Notice("Connected to Google Drive ✓", 8000);
-
-      try {
-        await this.ensureRemoteFolder();
-        await this.syncNow(false);
-        new Notice("Vault sync finished", 5000);
-      } catch (syncErr) {
-        console.warn("[GDrive Sync] Connected but first sync failed", syncErr);
-        new Notice(`Connected, but sync failed: ${String(syncErr)}`, 12000);
-      }
-      this.refreshSettingsTab?.();
+      await this.finishDeviceAuthSuccess(tokens);
     } catch (e) {
       this.deviceAuth = null;
+      const msg = e instanceof Error ? e.message : String(e);
+      this.settings.lastAuthError = msg;
+      await this.saveSettings();
       this.refreshSettingsTab?.();
       throw e;
     }
+  }
+
+  /**
+   * Finish after Google Allow when the in-memory poll died (common on Android).
+   * Uses pendingDeviceAuth saved in data.json.
+   */
+  async resumePendingDeviceAuth(reason: string): Promise<boolean> {
+    const pending = this.settings.pendingDeviceAuth;
+    if (!pending?.deviceCode) return false;
+    if (this.settings.tokens?.refreshToken) {
+      this.settings.pendingDeviceAuth = null;
+      await this.saveSettings();
+      return false;
+    }
+    if (Date.now() >= pending.expiresAt) {
+      this.settings.pendingDeviceAuth = null;
+      this.deviceAuth = null;
+      this.settings.lastAuthError =
+        "Device code expired after Google sign-in. Tap Connect Google again.";
+      await this.saveSettings();
+      this.refreshSettingsTab?.();
+      return false;
+    }
+
+    this.deviceAuth = {
+      userCode: pending.userCode,
+      verificationUrl: pending.verificationUrl,
+      phase: reason === "waiting" ? "waiting" : "checking",
+    };
+    this.refreshSettingsTab?.();
+    this.oauth.wakeDevicePoll();
+
+    if (this.deviceAuthResuming) return true;
+    this.deviceAuthResuming = true;
+
+    try {
+      applyBundledOAuthDefaults(this.settings);
+      const config = this.oauthConfig();
+      let intervalMs = Math.max(5000, pending.intervalMs || 5000);
+
+      // Immediate poll when user returns or taps Check now.
+      while (Date.now() < pending.expiresAt) {
+        if (this.settings.tokens?.refreshToken) return true;
+        if (!this.settings.pendingDeviceAuth) return false;
+
+        const result = await this.oauth.pollDeviceAuthOnce(config, pending.deviceCode);
+        if (result.kind === "tokens") {
+          await this.finishDeviceAuthSuccess(result.tokens);
+          return true;
+        }
+        if (result.kind === "slow_down") {
+          intervalMs += 5000;
+        } else if (result.kind === "error") {
+          this.settings.lastAuthError = result.message;
+          this.settings.pendingDeviceAuth = null;
+          this.deviceAuth = null;
+          await this.saveSettings();
+          this.refreshSettingsTab?.();
+          new Notice(`Connect failed: ${result.message}`, 14000);
+          return false;
+        }
+
+        this.deviceAuth = {
+          userCode: pending.userCode,
+          verificationUrl: pending.verificationUrl,
+          phase: "checking",
+        };
+        this.refreshSettingsTab?.();
+        await this.oauth.sleepInterruptible(intervalMs);
+      }
+
+      this.settings.pendingDeviceAuth = null;
+      this.deviceAuth = null;
+      this.settings.lastAuthError =
+        "Timed out waiting for Google. If google.com/device said success, tap Connect again.";
+      await this.saveSettings();
+      this.refreshSettingsTab?.();
+      return false;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.settings.lastAuthError = msg;
+      await this.saveSettings();
+      this.refreshSettingsTab?.();
+      return false;
+    } finally {
+      this.deviceAuthResuming = false;
+    }
+  }
+
+  private async finishDeviceAuthSuccess(tokens: TokenSet): Promise<void> {
+    this.deviceAuth = null;
+    this.settings.pendingDeviceAuth = null;
+    this.settings.lastAuthError = null;
+    await this.applyTokens(tokens);
+    this.refreshSettingsTab?.();
+    new Notice("Connected to Google Drive ✓", 8000);
+
+    try {
+      await this.ensureRemoteFolder();
+      await this.syncNow(false);
+      new Notice("Vault sync finished", 5000);
+    } catch (syncErr) {
+      console.warn("[GDrive Sync] Connected but first sync failed", syncErr);
+      new Notice(`Connected, but sync failed: ${String(syncErr)}`, 12000);
+    }
+    this.refreshSettingsTab?.();
+  }
+
+  /** User tapped “I allowed access” — poll Google immediately using saved device_code. */
+  async checkDeviceAuthNow(): Promise<void> {
+    if (this.settings.pendingDeviceAuth) {
+      await this.resumePendingDeviceAuth("check-now");
+      return;
+    }
+    this.oauth.wakeDevicePoll();
+    if (this.deviceAuth) {
+      this.deviceAuth = { ...this.deviceAuth, phase: "checking" };
+      this.refreshSettingsTab?.();
+    }
+    new Notice("Checking Google…", 4000);
   }
 
   async completeManualAuth(raw: string): Promise<void> {
@@ -341,6 +471,9 @@ export default class GDriveSyncPlugin extends Plugin {
     const token = this.settings.tokens?.refreshToken || this.settings.tokens?.accessToken;
     if (token) await revokeToken(token);
     this.settings.tokens = null;
+    this.settings.pendingDeviceAuth = null;
+    this.settings.lastAuthError = null;
+    this.deviceAuth = null;
     this.drive = null;
     this.engine?.setDrive(null);
     await this.saveSettings();

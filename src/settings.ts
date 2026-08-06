@@ -14,6 +14,15 @@ export interface TokenSet {
   scope?: string;
 }
 
+/** Survives mobile WebView pause/kill so we can finish after Google Allow. */
+export interface PendingDeviceAuth {
+  deviceCode: string;
+  userCode: string;
+  verificationUrl: string;
+  expiresAt: number;
+  intervalMs: number;
+}
+
 export interface SyncIndexEntry {
   driveFileId: string;
   hash: string;
@@ -36,6 +45,10 @@ export interface GDriveSyncSettings {
   redirectUri: string;
   /** Persisted across app switches so token exchange uses the same redirect_uri. */
   pendingOAuthRedirectUri: string;
+  /** In-progress device-code login (mobile). Cleared on success/expiry. */
+  pendingDeviceAuth: PendingDeviceAuth | null;
+  /** Last connect failure shown in settings (Google UI can succeed while this fails). */
+  lastAuthError: string | null;
   tokens: TokenSet | null;
   remoteFolderName: string;
   remoteFolderId: string;
@@ -66,6 +79,8 @@ export const DEFAULT_SETTINGS: GDriveSyncSettings = {
   clientSecret: BUNDLED_CLIENT_SECRET,
   redirectUri: BUNDLED_REDIRECT_URI,
   pendingOAuthRedirectUri: "",
+  pendingDeviceAuth: null,
+  lastAuthError: null,
   tokens: null,
   remoteFolderName: "",
   remoteFolderId: "",
@@ -205,6 +220,16 @@ export class GDriveSyncSettingTab extends PluginSettingTab {
       );
 
     const connected = !!this.plugin.settings.tokens?.refreshToken;
+    const pending = this.plugin.settings.pendingDeviceAuth;
+    // Restore UI from disk if in-memory deviceAuth was lost (WebView restart).
+    if (!this.plugin.deviceAuth && pending && Date.now() < pending.expiresAt && !connected) {
+      this.plugin.deviceAuth = {
+        userCode: pending.userCode,
+        verificationUrl: pending.verificationUrl,
+        phase: "waiting",
+      };
+    }
+
     const statusEl = containerEl.createDiv({ cls: "gdrive-sync-conn-status" });
     if (connected) {
       statusEl.addClass("is-connected");
@@ -212,11 +237,16 @@ export class GDriveSyncSettingTab extends PluginSettingTab {
     } else if (this.plugin.deviceAuth?.phase === "checking") {
       statusEl.addClass("is-waiting");
       statusEl.setText("Status: Checking Google approval… stay in Obsidian");
-    } else if (this.plugin.deviceAuth) {
+    } else if (this.plugin.deviceAuth || pending) {
       statusEl.addClass("is-waiting");
       statusEl.setText("Status: Waiting for you to Allow access in Google");
     } else {
       statusEl.setText("Status: Not connected");
+    }
+
+    if (this.plugin.settings.lastAuthError && !connected) {
+      const err = containerEl.createDiv({ cls: "gdrive-sync-auth-error" });
+      err.setText(`Last connect error: ${this.plugin.settings.lastAuthError}`);
     }
 
     new Setting(containerEl)
@@ -225,7 +255,7 @@ export class GDriveSyncSettingTab extends PluginSettingTab {
         connected
           ? "Connected. Use the same Google account on every device."
           : Platform.isMobile
-            ? "Tap Connect → enter the code at google.com/device → Allow → return to Obsidian. There is no redirect."
+            ? "Tap Connect → copy code → Allow at google.com/device → return here (no redirect). Then tap “I allowed access”."
             : "Desktop opens the browser automatically; falls back to device code if needed."
       )
       .addButton((btn) =>
@@ -276,7 +306,7 @@ export class GDriveSyncSettingTab extends PluginSettingTab {
         new Notice(ok ? `Copied ${userCode}` : "Could not copy — long-press the code", 4000);
       });
       box.createEl("p", {
-        text: "2. Open google.com/device, paste the code, tap Allow, then return here (no redirect).",
+        text: "2. Open google.com/device, paste the code, tap Allow, then return here. Google will not send you back — that is normal.",
       });
       new Setting(box)
         .addButton((btn) =>
@@ -297,7 +327,7 @@ export class GDriveSyncSettingTab extends PluginSettingTab {
           })
         );
       new Setting(box).addButton((btn) =>
-        btn.setButtonText("I allowed access — check now").onClick(() => {
+        btn.setButtonText("I allowed access — check now").setCta().onClick(async () => {
           if (this.plugin.deviceAuth) {
             this.plugin.deviceAuth = {
               ...this.plugin.deviceAuth,
@@ -305,8 +335,9 @@ export class GDriveSyncSettingTab extends PluginSettingTab {
             };
             this.display();
           }
-          this.plugin.oauth.wakeDevicePoll();
           new Notice("Checking Google…", 4000);
+          await this.plugin.checkDeviceAuthNow();
+          this.display();
         })
       );
     }
