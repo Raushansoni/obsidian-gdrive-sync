@@ -1,0 +1,28 @@
+{
+  "name": "obsidian-gdrive-sync",
+  "version": "1.0.0",
+  "description": "Sync Obsidian vaults across Android, Windows, macOS, and Linux using Google Drive",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "setup": "node scripts/setup.mjs",
+    "install-to-vault": "node scripts/install-to-vault.mjs"
+  },
+  "keywords": [
+    "obsidian",
+    "plugin",
+    "google-drive",
+    "sync"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.20.0",
+    "obsidian": "^1.5.7-1",
+    "tslib": "^2.6.2",
+    "typescript": "^5.3.3"
+  }
+}

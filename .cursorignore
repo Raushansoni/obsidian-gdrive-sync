@@ -1,0 +1,29 @@
+﻿# Dependencies & lock noise
+node_modules/
+package-lock.json
+
+# Build / pack artifacts
+main.js
+main.js.map
+dist/
+*.tgz
+obsidian-gdrive-sync.zip
+
+# Secrets & local env
+.env
+.env.*
+**/client_secret*.json
+**/credentials*.json
+data.json
+
+# Obsidian runtime
+.obsidian/
+
+# Logs / OS junk
+*.log
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Git internals
+.git/

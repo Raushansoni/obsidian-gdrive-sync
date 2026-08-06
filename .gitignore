@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+**/client_secret*.json
+**/credentials*.json
+
+# Obsidian vault runtime (never commit)
+data.json
+.obsidian/
+
+# Build sourcemaps (main.js is committed for BRAT)
+main.js.map
+
+# Logs / OS
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Cursor
+.cursor/
+.cursorignore.local
+
+# Pack output
+dist/
+*.tgz
+obsidian-gdrive-sync.zip

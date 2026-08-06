@@ -1,0 +1,76 @@
+name: Build and release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag without v (e.g. 1.0.0). Leave empty to use manifest.json."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install & build
+        run: |
+          npm ci
+          npm run build
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION=$(node -p "require('./manifest.json').version")
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure manifest version matches
+        run: |
+          node <<'EOF'
+          const fs = require('fs');
+          const version = process.env.VERSION;
+          for (const file of ['manifest.json', 'package.json']) {
+            const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+            j.version = version;
+            fs.writeFileSync(file, JSON.stringify(j, null, 2) + '\n');
+          }
+          const versions = JSON.parse(fs.readFileSync('versions.json', 'utf8'));
+          versions[version] = JSON.parse(fs.readFileSync('manifest.json', 'utf8')).minAppVersion;
+          fs.writeFileSync('versions.json', JSON.stringify(versions, null, 2) + '\n');
+          EOF
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+
+      - name: Create GitHub Release (BRAT assets)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            main.js
+            manifest.json
+            styles.css
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
