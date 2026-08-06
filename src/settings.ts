@@ -1,5 +1,10 @@
 import { App, PluginSettingTab, Setting, Notice, Platform } from "obsidian";
 import type GDriveSyncPlugin from "./main";
+import {
+  BUNDLED_CLIENT_ID,
+  BUNDLED_CLIENT_SECRET,
+  BUNDLED_REDIRECT_URI,
+} from "./bundled-oauth";
 
 export interface TokenSet {
   accessToken: string;
@@ -55,9 +60,9 @@ export const DEFAULT_IGNORE = [
 ].join("\n");
 
 export const DEFAULT_SETTINGS: GDriveSyncSettings = {
-  clientId: "",
-  clientSecret: "",
-  redirectUri: "http://127.0.0.1:42813/",
+  clientId: BUNDLED_CLIENT_ID,
+  clientSecret: BUNDLED_CLIENT_SECRET,
+  redirectUri: BUNDLED_REDIRECT_URI,
   tokens: null,
   remoteFolderName: "",
   remoteFolderId: "",
@@ -68,6 +73,19 @@ export const DEFAULT_SETTINGS: GDriveSyncSettings = {
   lastSyncAt: null,
   lastError: null,
 };
+
+/** Fill OAuth fields from the build-time bundle when local settings are empty. */
+export function applyBundledOAuthDefaults(settings: GDriveSyncSettings): void {
+  if (!settings.clientId?.trim() && BUNDLED_CLIENT_ID) {
+    settings.clientId = BUNDLED_CLIENT_ID;
+  }
+  if (!settings.clientSecret?.trim() && BUNDLED_CLIENT_SECRET) {
+    settings.clientSecret = BUNDLED_CLIENT_SECRET;
+  }
+  if (!settings.redirectUri?.trim() && BUNDLED_REDIRECT_URI) {
+    settings.redirectUri = BUNDLED_REDIRECT_URI;
+  }
+}
 
 export class GDriveSyncSettingTab extends PluginSettingTab {
   plugin: GDriveSyncPlugin;
@@ -88,9 +106,19 @@ export class GDriveSyncSettingTab extends PluginSettingTab {
       text: "Sync this vault across Android, Windows, macOS, and Linux with the same Google account and remote folder name.",
     });
 
+    if (BUNDLED_CLIENT_ID && this.plugin.settings.clientId?.trim() === BUNDLED_CLIENT_ID) {
+      containerEl.createEl("p", {
+        text: "OAuth Client ID is pre-filled from the plugin build. Tap Connect Google below (no need to paste it first).",
+      });
+    }
+
     new Setting(containerEl)
       .setName("Google OAuth Client ID")
-      .setDesc("From Google Cloud Console → APIs & Services → Credentials (Desktop or Web client).")
+      .setDesc(
+        BUNDLED_CLIENT_ID
+          ? "Pre-filled for this build. Leave as-is unless you use your own Google Cloud client."
+          : "From Google Cloud Console → APIs & Services → Credentials (Desktop or Web client)."
+      )
       .addText((text) =>
         text
           .setPlaceholder("xxxxx.apps.googleusercontent.com")

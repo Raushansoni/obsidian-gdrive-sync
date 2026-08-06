@@ -1,4 +1,6 @@
 import esbuild from "esbuild";
+import fs from "fs";
+import path from "path";
 import process from "process";
 import builtins from "builtin-modules";
 
@@ -8,7 +10,42 @@ if you want to view the source, please visit the github repository of this plugi
 */
 `;
 
+function loadEnvFile() {
+  const envPath = path.join(process.cwd(), ".env");
+  if (!fs.existsSync(envPath)) return;
+  for (const line of fs.readFileSync(envPath, "utf8").split(/\r?\n/)) {
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+    if (!m) continue;
+    let val = m[2];
+    if (
+      (val.startsWith('"') && val.endsWith('"')) ||
+      (val.startsWith("'") && val.endsWith("'"))
+    ) {
+      val = val.slice(1, -1);
+    }
+    if (!process.env[m[1]]) process.env[m[1]] = val;
+  }
+}
+
+loadEnvFile();
+
 const prod = process.argv[2] === "production";
+
+const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID || process.env.OBSIDIAN_GDRIVE_CLIENT_ID || "";
+const clientSecret =
+  process.env.GOOGLE_OAUTH_CLIENT_SECRET || process.env.OBSIDIAN_GDRIVE_CLIENT_SECRET || "";
+const redirectUri =
+  process.env.GOOGLE_OAUTH_REDIRECT_URI ||
+  process.env.OBSIDIAN_GDRIVE_REDIRECT_URI ||
+  "http://localhost:42813/";
+
+if (prod && clientId) {
+  console.log(`[esbuild] Bundling OAuth Client ID into main.js (${clientId.slice(0, 12)}…)`);
+} else if (prod) {
+  console.warn(
+    "[esbuild] No GOOGLE_OAUTH_CLIENT_ID in env/.env — Connect Google will require pasting Client ID."
+  );
+}
 
 const context = await esbuild.context({
   banner: { js: banner },
@@ -36,6 +73,11 @@ const context = await esbuild.context({
   sourcemap: prod ? false : "inline",
   treeShaking: true,
   outfile: "main.js",
+  define: {
+    __GDRIVE_CLIENT_ID__: JSON.stringify(clientId),
+    __GDRIVE_CLIENT_SECRET__: JSON.stringify(clientSecret),
+    __GDRIVE_REDIRECT_URI__: JSON.stringify(redirectUri),
+  },
 });
 
 if (prod) {

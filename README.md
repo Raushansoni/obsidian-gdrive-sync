@@ -57,9 +57,11 @@ Files live under Google Drive:
    `https://github.com/Raushansoni/obsidian-gdrive-sync`
 
 5. Enable **Google Drive Sync** in Community plugins  
-6. Plugin settings → Client ID → **Connect Google** → same **Remote folder name** as your PC → **Sync now**
+6. Plugin settings → **Connect Google** (Client ID is pre-filled in official releases) → same **Remote folder name** as your PC → **Sync now**
 
 BRAT installs from GitHub **Releases** (`main.js`, `manifest.json`, `styles.css`). After updates: **BRAT: Check for plugin updates**.
+
+Official release builds bake in the OAuth client at compile time (via CI secrets / local `.env`). The GitHub **source** does not contain those values.
 
 ### Desktop — local setup script
 

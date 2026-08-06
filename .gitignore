@@ -12,7 +12,8 @@ node_modules/
 data.json
 .obsidian/
 
-# Build sourcemaps (main.js is committed for BRAT)
+# Built plugin binary — ship via GitHub Releases only (may contain baked OAuth)
+main.js
 main.js.map
 
 # Logs / OS

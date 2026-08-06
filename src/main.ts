@@ -8,6 +8,7 @@ import {
 import {
   DEFAULT_SETTINGS,
   GDriveSyncSettingTab,
+  applyBundledOAuthDefaults,
   type GDriveSyncSettings,
   type TokenSet,
 } from "./settings";
@@ -141,6 +142,8 @@ export default class GDriveSyncPlugin extends Plugin {
   async loadSettings(): Promise<void> {
     const data = (await this.loadData()) as Partial<GDriveSyncSettings> | null;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+    // Empty strings from an old data.json must not block bundled OAuth defaults.
+    applyBundledOAuthDefaults(this.settings);
     if (!this.settings.syncIndex || this.settings.syncIndex.version !== 1) {
       this.settings.syncIndex = { version: 1, files: {} };
     }
@@ -180,8 +183,18 @@ export default class GDriveSyncPlugin extends Plugin {
   }
 
   async connectGoogle(): Promise<void> {
-    if (!this.settings.clientId) {
+    applyBundledOAuthDefaults(this.settings);
+    if (!this.settings.clientId?.trim()) {
       new Notice("Add your Google OAuth Client ID in settings first");
+      try {
+        // Open plugin settings so the field is visible on mobile.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const setting = (this.app as any).setting;
+        setting?.open?.();
+        setting?.openTabById?.(this.manifest.id);
+      } catch {
+        /* ignore */
+      }
       return;
     }
 
