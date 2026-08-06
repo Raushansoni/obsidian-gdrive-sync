@@ -1,7 +1,7 @@
 {
   "id": "obsidian-gdrive-sync",
   "name": "Google Drive Sync",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "minAppVersion": "1.5.0",
   "description": "Bidirectional vault sync across Android, Windows, macOS, and Linux using Google Drive storage.",
   "author": "Obsidian GDrive Sync",

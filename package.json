@@ -1,6 +1,6 @@
 {
   "name": "obsidian-gdrive-sync",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Sync Obsidian vaults across Android, Windows, macOS, and Linux using Google Drive",
   "main": "main.js",
   "scripts": {

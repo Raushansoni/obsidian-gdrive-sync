@@ -103,7 +103,6 @@ export function applyBundledOAuthDefaults(settings: GDriveSyncSettings): void {
 
 export class GDriveSyncSettingTab extends PluginSettingTab {
   plugin: GDriveSyncPlugin;
-  private pendingAuthCode = "";
 
   constructor(app: App, plugin: GDriveSyncPlugin) {
     super(app, plugin);
@@ -191,8 +190,8 @@ export class GDriveSyncSettingTab extends PluginSettingTab {
         connected
           ? "Connected. Use the same account on every device."
           : Platform.isMobile
-            ? "On mobile: Connect opens the browser. Paste the redirect URL or code below."
-            : "Connect opens your browser and finishes automatically on desktop."
+            ? "Mobile uses Google device login (no localhost). Tap Connect, then enter the code at google.com/device."
+            : "Desktop opens the browser automatically; falls back to device code if needed."
       )
       .addButton((btn) =>
         btn
@@ -200,10 +199,17 @@ export class GDriveSyncSettingTab extends PluginSettingTab {
           .setCta()
           .onClick(async () => {
             try {
+              // Refresh UI while device-code polling runs.
+              const refresh = window.setInterval(() => {
+                if (this.plugin.deviceAuth) this.display();
+                else window.clearInterval(refresh);
+              }, 800);
               await this.plugin.connectGoogle();
+              window.clearInterval(refresh);
               this.display();
             } catch (e) {
-              new Notice(`Connect failed: ${String(e)}`);
+              new Notice(`Connect failed: ${String(e)}`, 12000);
+              this.display();
             }
           })
       )
@@ -218,33 +224,23 @@ export class GDriveSyncSettingTab extends PluginSettingTab {
           })
       );
 
-    if (!connected || Platform.isMobile) {
-      const authBox = containerEl.createDiv({ cls: "gdrive-sync-auth-box" });
-      authBox.createEl("div", {
-        text: "If the HTTPS callback opened Obsidian automatically, you’re done. Otherwise paste the code from the callback page (or any URL with code=) here and Submit.",
+    if (this.plugin.deviceAuth) {
+      const box = containerEl.createDiv({ cls: "gdrive-sync-auth-box" });
+      box.createEl("h3", { text: "Finish Google sign-in" });
+      box.createEl("p", {
+        text: `1. Open ${this.plugin.deviceAuth.verificationUrl}`,
       });
-      const area = authBox.createEl("textarea");
-      area.placeholder = "http://127.0.0.1:42813/?code=...   or   4/0Afc...";
-      area.value = this.pendingAuthCode;
-      area.addEventListener("input", () => {
-        this.pendingAuthCode = area.value;
+      box.createEl("p", {
+        text: `2. Enter this code: ${this.plugin.deviceAuth.userCode}`,
       });
-      new Setting(authBox)
-        .addButton((btn) =>
-          btn
-            .setButtonText("Submit auth code")
-            .setCta()
-            .onClick(async () => {
-              try {
-                await this.plugin.completeManualAuth(this.pendingAuthCode);
-                this.pendingAuthCode = "";
-                new Notice("Google account connected");
-                this.display();
-              } catch (e) {
-                new Notice(`Auth failed: ${String(e)}`);
-              }
-            })
-        );
+      box.createEl("p", {
+        text: "3. Allow Drive access — Obsidian will connect automatically.",
+      });
+      new Setting(box).addButton((btn) =>
+        btn.setButtonText("Open google.com/device").setCta().onClick(() => {
+          window.open(this.plugin.deviceAuth!.verificationUrl);
+        })
+      );
     }
 
     new Setting(containerEl)

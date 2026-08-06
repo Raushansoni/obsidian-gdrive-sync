@@ -80,29 +80,31 @@ npm run setup -- --rebuild
 
 Then: Connect Google → Remote folder name → Sync now.
 
-## Why mobile showed `CONNECTION_REFUSED` (root cause)
+## Why mobile showed `CONNECTION_REFUSED` / Web client “Create failed”
 
-Google was told to redirect to `http://127.0.0.1:42813/`. On a phone **nothing listens** on that address, so the browser always reports connection refused. That is not a Drive/API outage — loopback OAuth cannot finish inside a mobile browser.
+1. **CONNECTION_REFUSED:** Google redirected to `http://127.0.0.1:42813/` — phones have nothing listening there.  
+2. **Web client Create failed:** Google often rejects `github.io` (and JS origins that include a path) as non-compliant domains.
 
-**Fix (v1.0.3+):** mobile uses an HTTPS callback page, then `obsidian://gdrive-sync?code=…`.
+**Fix (v1.0.4+): Google device-code login on mobile** — no redirect URI at all.
 
-### Google Cloud — use a Web application OAuth client
+### Google Cloud — create a “TVs and Limited Input devices” client
 
-Your old **Desktop** client only allows localhost. For phones, create (or switch to) **Web application**:
+1. [Credentials](https://console.cloud.google.com/apis/credentials) → **Create OAuth client ID**  
+2. Application type: **TVs and Limited Input devices**  
+3. Name it (e.g. `Obsidian GDrive Sync`) → **Create**  
+4. Copy **Client ID** + **Client Secret** (no redirect URIs to fill — Create cannot fail for domain rules)  
+5. Put them in GitHub secrets / `.env` and cut a release (or paste into plugin settings)  
+6. OAuth consent screen: **External** + **In production** so any Google account can approve
 
-1. Google Cloud → **Credentials → Create OAuth client ID → Web application**
-2. Authorized redirect URIs — add **both**:
-   - `http://127.0.0.1:42813/`
-   - `https://raushansoni.github.io/obsidian-gdrive-sync/oauth-callback.html`
-3. Copy Client ID + Secret into GitHub Actions secrets / local `.env`, cut a new release
-4. OAuth consent screen: **External** + **In production** (so any Google account can sign in)
+Keep your old **Desktop** client for PC browser loopback if you want; mobile uses the TV/device client (or the same baked credentials if you only ship the TV client and use device flow everywhere).
 
 ### Mobile auth (Android / iOS)
 
-1. Update plugin to **1.0.3+** via BRAT  
-2. Tap **Connect Google** → sign in  
-3. You should land on the GitHub Pages callback → **Open Obsidian** (or it auto-opens)  
-4. Set remote folder name → **Sync now**
+1. Update plugin to **1.0.4+** via BRAT  
+2. Tap **Connect Google**  
+3. Open **google.com/device** (button in settings)  
+4. Enter the on-screen code → Allow  
+5. Obsidian connects automatically → set remote folder → **Sync now**
 
 ## Commands
 

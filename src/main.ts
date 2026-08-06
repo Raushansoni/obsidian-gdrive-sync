@@ -27,6 +27,9 @@ export default class GDriveSyncPlugin extends Plugin {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private status: SyncStatus = "idle";
   private statusDetail = "";
+  /** Live device-code auth UI (mobile). */
+  deviceAuth: { userCode: string; verificationUrl: string } | null = null;
+  private deviceAuthCancel = false;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -208,8 +211,15 @@ export default class GDriveSyncPlugin extends Plugin {
     }
 
     const config = this.oauthConfig();
-    const isLoopback = this.oauth.usesLoopback(config.redirectUri);
 
+    // Mobile: device-code flow (no localhost redirect → no CONNECTION_REFUSED).
+    // Requires OAuth client type “TVs and Limited Input devices”.
+    if (Platform.isMobile) {
+      await this.connectWithDeviceFlow(config);
+      return;
+    }
+
+    const isLoopback = this.oauth.usesLoopback(config.redirectUri);
     if (Platform.isDesktopApp && isLoopback) {
       new Notice("Complete Google sign-in in your browser…");
       try {
@@ -222,32 +232,58 @@ export default class GDriveSyncPlugin extends Plugin {
         await this.syncNow(false);
         return;
       } catch (e) {
-        // Opening the browser again without a loopback server causes CONNECTION_REFUSED.
-        console.warn("[GDrive Sync] Desktop OAuth failed", e);
-        new Notice(
-          `Connect failed: ${String(e)}. If you have a code URL, paste it under Submit auth code.`,
-          10000
-        );
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const setting = (this.app as any).setting;
-          setting?.open?.();
-          setting?.openTabById?.(this.manifest.id);
-        } catch {
-          /* ignore */
-        }
+        console.warn("[GDrive Sync] Desktop OAuth failed, trying device flow", e);
+        new Notice("Browser connect failed — switching to device code…", 5000);
+        await this.connectWithDeviceFlow(config);
         return;
       }
     }
 
-    const { redirectUri } = this.oauth.openBrowserAuth(config);
-    await this.rememberOAuthRedirect(redirectUri);
-    new Notice(
-      Platform.isMobile
-        ? "Sign in with Google. You should return through the callback page into Obsidian."
-        : "Sign in with Google, then return to Obsidian.",
-      10000
-    );
+    await this.connectWithDeviceFlow(config);
+  }
+
+  private async connectWithDeviceFlow(config: {
+    clientId: string;
+    clientSecret: string;
+    redirectUri: string;
+  }): Promise<void> {
+    this.deviceAuthCancel = false;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const setting = (this.app as any).setting;
+      setting?.open?.();
+      setting?.openTabById?.(this.manifest.id);
+
+      const tokens = await this.oauth.connectDeviceFlow(
+        config,
+        (info) => {
+          this.deviceAuth = {
+            userCode: info.userCode,
+            verificationUrl: info.verificationUrl,
+          };
+          new Notice(
+            `Open ${info.verificationUrl} and enter code ${info.userCode}`,
+            15000
+          );
+          // Refresh settings pane so the code is visible.
+          this.app.workspace.trigger("gdrive-sync-device-auth");
+          try {
+            setting?.openTabById?.(this.manifest.id);
+          } catch {
+            /* ignore */
+          }
+        },
+        () => this.deviceAuthCancel
+      );
+      this.deviceAuth = null;
+      await this.applyTokens(tokens);
+      new Notice("Connected to Google Drive");
+      await this.ensureRemoteFolder();
+      await this.syncNow(false);
+    } catch (e) {
+      this.deviceAuth = null;
+      throw e;
+    }
   }
 
   async completeManualAuth(raw: string): Promise<void> {

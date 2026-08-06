@@ -2,6 +2,7 @@ import { Platform, requestUrl } from "obsidian";
 
 const AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
+const DEVICE_CODE_ENDPOINT = "https://oauth2.googleapis.com/device/code";
 const REVOKE_ENDPOINT = "https://oauth2.googleapis.com/revoke";
 
 /** drive.file = only files created/opened by this app — works across devices with same OAuth client. */
@@ -10,6 +11,9 @@ export const DRIVE_SCOPES = [
   "openid",
   "email",
 ].join(" ");
+
+/** Device-code flow (mobile). Must match Google's allowed device scopes list. */
+export const DEVICE_SCOPES = "https://www.googleapis.com/auth/drive.file openid email";
 
 export const DESKTOP_REDIRECT_PORT = 42813;
 export const DESKTOP_REDIRECT_URI = `http://127.0.0.1:${DESKTOP_REDIRECT_PORT}/`;
@@ -330,6 +334,109 @@ export class GoogleOAuth {
     return { redirectUri };
   }
 
+  /**
+   * OAuth 2.0 device authorization (TV / limited-input).
+   * No redirect URI — avoids CONNECTION_REFUSED and Google blocking github.io Web clients.
+   * Requires an OAuth client of type “TVs and Limited Input devices”.
+   */
+  async connectDeviceFlow(
+    config: OAuthConfig,
+    onUserCode: (info: {
+      userCode: string;
+      verificationUrl: string;
+      expiresIn: number;
+    }) => void,
+    shouldCancel?: () => boolean
+  ): Promise<OAuthTokens> {
+    const body = new URLSearchParams({
+      client_id: config.clientId,
+      scope: DEVICE_SCOPES,
+    });
+    const start = await requestUrl({
+      url: DEVICE_CODE_ENDPOINT,
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+      throw: false,
+    });
+    if (start.status >= 400) {
+      throw new Error(
+        `Device auth start failed (${start.status}): ${start.text}. ` +
+          `Create an OAuth client type “TVs and Limited Input devices” (no redirect URIs).`
+      );
+    }
+    const data = start.json as {
+      device_code: string;
+      user_code: string;
+      verification_url: string;
+      verification_uri?: string;
+      expires_in: number;
+      interval?: number;
+    };
+    const verificationUrl = data.verification_uri || data.verification_url || "https://www.google.com/device";
+    onUserCode({
+      userCode: data.user_code,
+      verificationUrl,
+      expiresIn: data.expires_in,
+    });
+
+    let intervalMs = Math.max(5, data.interval ?? 5) * 1000;
+    const deadline = Date.now() + data.expires_in * 1000;
+
+    while (Date.now() < deadline) {
+      if (shouldCancel?.()) throw new Error("Device auth cancelled");
+      await sleep(intervalMs);
+      if (shouldCancel?.()) throw new Error("Device auth cancelled");
+
+      const pollBody = new URLSearchParams({
+        client_id: config.clientId,
+        client_secret: config.clientSecret,
+        device_code: data.device_code,
+        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+      });
+      const poll = await requestUrl({
+        url: TOKEN_ENDPOINT,
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: pollBody.toString(),
+        throw: false,
+      });
+      const json = poll.json as {
+        error?: string;
+        access_token?: string;
+        refresh_token?: string;
+        expires_in?: number;
+        token_type?: string;
+        scope?: string;
+      };
+
+      if (poll.status < 400 && json.access_token) {
+        if (!json.refresh_token) {
+          throw new Error(
+            "No refresh token from device flow. Revoke app access at Google Account permissions and retry."
+          );
+        }
+        return {
+          accessToken: json.access_token,
+          refreshToken: json.refresh_token,
+          expiresAt: Date.now() + (json.expires_in ?? 3600) * 1000,
+          tokenType: json.token_type ?? "Bearer",
+          scope: json.scope,
+        };
+      }
+
+      if (json.error === "authorization_pending") continue;
+      if (json.error === "slow_down") {
+        intervalMs += 5000;
+        continue;
+      }
+      if (json.error === "access_denied") throw new Error("Google access was denied");
+      if (json.error === "expired_token") throw new Error("Device code expired — tap Connect again");
+      throw new Error(`Device auth failed: ${json.error || poll.text}`);
+    }
+    throw new Error("Device auth timed out — tap Connect again");
+  }
+
   async completeWithCode(config: OAuthConfig, rawInput: string): Promise<OAuthTokens> {
     const code = extractCodeFromInput(rawInput);
     const redirectUri =
@@ -351,4 +458,8 @@ export class GoogleOAuth {
       this.serverCloser = null;
     }
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
