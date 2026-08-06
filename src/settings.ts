@@ -4,7 +4,6 @@ import {
   BUNDLED_CLIENT_ID,
   BUNDLED_CLIENT_SECRET,
   BUNDLED_REDIRECT_URI,
-  BUNDLED_MOBILE_REDIRECT_URI,
 } from "./bundled-oauth";
 
 export interface TokenSet {
@@ -35,8 +34,6 @@ export interface GDriveSyncSettings {
   clientSecret: string;
   /** Desktop loopback redirect — must match an Authorized redirect URI. */
   redirectUri: string;
-  /** HTTPS callback for mobile (GitHub Pages). Required — loopback always CONNECTION_REFUSED on phones. */
-  mobileRedirectUri: string;
   /** Persisted across app switches so token exchange uses the same redirect_uri. */
   pendingOAuthRedirectUri: string;
   tokens: TokenSet | null;
@@ -68,7 +65,6 @@ export const DEFAULT_SETTINGS: GDriveSyncSettings = {
   clientId: BUNDLED_CLIENT_ID,
   clientSecret: BUNDLED_CLIENT_SECRET,
   redirectUri: BUNDLED_REDIRECT_URI,
-  mobileRedirectUri: BUNDLED_MOBILE_REDIRECT_URI,
   pendingOAuthRedirectUri: "",
   tokens: null,
   remoteFolderName: "",
@@ -81,24 +77,27 @@ export const DEFAULT_SETTINGS: GDriveSyncSettings = {
   lastError: null,
 };
 
-/** Fill OAuth fields from the build-time bundle when local settings are empty. */
+/**
+ * Prefer build-time OAuth client. Official releases bake the TVs/Limited-Input client
+ * required for mobile device-code auth. Stale Desktop client IDs in data.json cause
+ * invalid_client / "Invalid client type" on Connect.
+ */
 export function applyBundledOAuthDefaults(settings: GDriveSyncSettings): void {
-  if (!settings.clientId?.trim() && BUNDLED_CLIENT_ID) {
+  if (BUNDLED_CLIENT_ID) {
     settings.clientId = BUNDLED_CLIENT_ID;
   }
-  if (!settings.clientSecret?.trim() && BUNDLED_CLIENT_SECRET) {
+  if (BUNDLED_CLIENT_SECRET) {
     settings.clientSecret = BUNDLED_CLIENT_SECRET;
   }
   if (!settings.redirectUri?.trim() && BUNDLED_REDIRECT_URI) {
     settings.redirectUri = BUNDLED_REDIRECT_URI;
   }
-  if (!settings.mobileRedirectUri?.trim() && BUNDLED_MOBILE_REDIRECT_URI) {
-    settings.mobileRedirectUri = BUNDLED_MOBILE_REDIRECT_URI;
-  }
   // Older builds used http://localhost:42813/ which can CONNECTION_REFUSED via IPv6.
   if (/^http:\/\/localhost:42813\/?$/i.test(settings.redirectUri?.trim() || "")) {
     settings.redirectUri = BUNDLED_REDIRECT_URI || "http://127.0.0.1:42813/";
   }
+  // Drop obsolete GitHub Pages mobile HTTPS callback (device-code flow replaced it).
+  delete (settings as { mobileRedirectUri?: string }).mobileRedirectUri;
 }
 
 export class GDriveSyncSettingTab extends PluginSettingTab {
@@ -157,28 +156,13 @@ export class GDriveSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Desktop redirect URI")
-      .setDesc("Loopback for PC/Mac. Must be allowed on your Google OAuth client.")
+      .setDesc("Loopback for PC/Mac. Must be allowed on your Google OAuth client. Mobile uses device-code login (no redirect URI).")
       .addText((text) =>
         text
           .setPlaceholder("http://127.0.0.1:42813/")
           .setValue(this.plugin.settings.redirectUri)
           .onChange(async (value) => {
             this.plugin.settings.redirectUri = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Mobile redirect URI")
-      .setDesc(
-        "HTTPS callback page (not localhost). Localhost on phones always shows CONNECTION_REFUSED."
-      )
-      .addText((text) =>
-        text
-          .setPlaceholder("https://raushansoni.github.io/obsidian-gdrive-sync/oauth-callback.html")
-          .setValue(this.plugin.settings.mobileRedirectUri)
-          .onChange(async (value) => {
-            this.plugin.settings.mobileRedirectUri = value.trim();
             await this.plugin.saveSettings();
           })
       );

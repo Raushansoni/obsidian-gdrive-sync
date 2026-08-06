@@ -145,13 +145,17 @@ export default class GDriveSyncPlugin extends Plugin {
   async loadSettings(): Promise<void> {
     const data = (await this.loadData()) as Partial<GDriveSyncSettings> | null;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
-    // Empty strings from an old data.json must not block bundled OAuth defaults.
+    const beforeId = this.settings.clientId;
     applyBundledOAuthDefaults(this.settings);
     if (!this.settings.syncIndex || this.settings.syncIndex.version !== 1) {
       this.settings.syncIndex = { version: 1, files: {} };
     }
     if (!this.settings.remoteFolderName) {
       this.settings.remoteFolderName = this.app.vault.getName();
+    }
+    // Persist when bundled OAuth replaces a stale Desktop client saved on the device.
+    if (this.settings.clientId && this.settings.clientId !== beforeId) {
+      await this.saveData(this.settings);
     }
   }
 
@@ -161,15 +165,11 @@ export default class GDriveSyncPlugin extends Plugin {
   }
 
   private oauthConfig() {
-    const desktop = this.settings.redirectUri || DESKTOP_REDIRECT_URI;
-    const mobile =
-      this.settings.mobileRedirectUri?.trim() ||
-      "https://raushansoni.github.io/obsidian-gdrive-sync/oauth-callback.html";
     return {
       clientId: this.settings.clientId,
       clientSecret: this.settings.clientSecret,
-      // Loopback on phones always yields CONNECTION_REFUSED — use HTTPS callback instead.
-      redirectUri: Platform.isMobile ? mobile : desktop,
+      // Desktop loopback only; mobile uses device-code flow (no redirect URI).
+      redirectUri: this.settings.redirectUri || DESKTOP_REDIRECT_URI,
     };
   }
 
