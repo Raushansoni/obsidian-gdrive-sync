@@ -253,6 +253,8 @@ export class SyncEngine {
   }
 
   private async readLocal(file: TFile): Promise<{ data: ArrayBuffer; hash: string; mtime: number; size: number }> {
+    // Canvas (and some other views) keep edits in memory; flush before hashing/upload.
+    await this.flushOpenEditors(file.path);
     const data = await this.app.vault.readBinary(file);
     const hash = await sha256Hex(data);
     return {
@@ -343,21 +345,30 @@ export class SyncEngine {
     const remoteMtime = remote.modifiedTime ? Date.parse(remote.modifiedTime) : 0;
     const remoteHashProp = remote.appProperties?.sha256;
 
-    // Identical to last sync
+    // Local unchanged since last sync — only skip if remote is also unchanged.
+    // Do NOT treat md5Checksum presence as proof of identical content (that blocked pulls).
     if (entry && entry.hash === localInfo.hash && entry.driveFileId === remote.id) {
-      if (remoteHashProp && remoteHashProp === localInfo.hash) return;
-      // Remote may have same content without prop — still skip if sizes match and mtimes close
-      if (remote.md5Checksum && entry.hash === localInfo.hash) return;
+      if (remoteHashProp) {
+        if (remoteHashProp === localInfo.hash) return;
+        // Remote sha256 differs → fall through and pull
+      } else {
+        const remoteSize = remote.size != null ? Number(remote.size) : NaN;
+        if (
+          Number.isFinite(remoteSize) &&
+          remoteSize === localInfo.size &&
+          remoteMtime > 0 &&
+          Math.abs(remoteMtime - localInfo.mtime) < 3000
+        ) {
+          return;
+        }
+        // Ambiguous without sha256 — fall through and compare bytes
+      }
     }
 
-    // Fetch remote content hash if needed
+    // Fetch remote content hash if needed (prefer appProperties.sha256; download only when missing)
     let remoteData: ArrayBuffer | null = null;
     let remoteHash = remoteHashProp ?? "";
-    const needRemoteBytes =
-      !remoteHash ||
-      (entry && entry.hash !== localInfo.hash && (!remoteHash || remoteHash !== entry.hash));
-
-    if (!remoteHash || needRemoteBytes) {
+    if (!remoteHash) {
       remoteData = await this.drive.download(remote.id);
       remoteHash = await sha256Hex(remoteData);
     }
@@ -479,11 +490,65 @@ export class SyncEngine {
     const existing = this.app.vault.getAbstractFileByPath(normalized);
     if (existing instanceof TFile) {
       await this.app.vault.modifyBinary(existing, data);
-      return;
+    } else {
+      // createBinary requires folder to exist
+      await this.app.vault.createBinary(normalized, data);
     }
 
-    // createBinary requires folder to exist
-    await this.app.vault.createBinary(normalized, data);
+    // Canvas views keep an in-memory board; force reload so pulled content shows up.
+    this.reloadOpenViews(normalized);
+  }
+
+  /**
+   * Ask open editors (esp. Canvas) to flush pending in-memory edits to disk
+   * before we read/hash/upload the file.
+   */
+  private async flushOpenEditors(path: string): Promise<void> {
+    const target = normalizeVaultPath(path);
+    let flushed = false;
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      const view = leaf.view as {
+        file?: TFile;
+        requestSave?: () => void;
+        save?: () => void | Promise<void>;
+        getViewType?: () => string;
+      };
+      const file = view.file;
+      if (!file || normalizeVaultPath(file.path) !== target) return;
+      try {
+        if (typeof view.requestSave === "function") {
+          view.requestSave();
+          flushed = true;
+        } else if (typeof view.save === "function") {
+          void view.save();
+          flushed = true;
+        }
+      } catch {
+        // ignore editor-specific save failures
+      }
+    });
+    if (flushed && target.toLowerCase().endsWith(".canvas")) {
+      await sleep(150);
+    }
+  }
+
+  /** Rebuild open leaves for a path so Canvas (and similar) pick up disk changes. */
+  private reloadOpenViews(path: string): void {
+    const target = normalizeVaultPath(path);
+    const isCanvas = target.toLowerCase().endsWith(".canvas");
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      const view = leaf.view as { file?: TFile; getViewType?: () => string };
+      const file = view.file;
+      if (!file || normalizeVaultPath(file.path) !== target) return;
+      const viewType = view.getViewType?.() ?? "";
+      if (!isCanvas && viewType !== "canvas") return;
+      try {
+        const rebuild = (leaf as { rebuildView?: () => void | Promise<void> }).rebuildView;
+        if (typeof rebuild === "function") void rebuild.call(leaf);
+      } catch {
+        // ignore
+      }
+    });
   }
 
   private async ensureLocalFolder(folderPath: string): Promise<void> {
@@ -502,4 +567,8 @@ export class SyncEngine {
       }
     }
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }

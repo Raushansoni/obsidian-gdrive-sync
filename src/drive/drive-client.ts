@@ -420,7 +420,7 @@ export class DriveClient {
   guessMime(path: string): string {
     const lower = path.toLowerCase();
     if (lower.endsWith(".md")) return "text/markdown";
-    if (lower.endsWith(".json")) return "application/json";
+    if (lower.endsWith(".json") || lower.endsWith(".canvas")) return "application/json";
     if (lower.endsWith(".png")) return "image/png";
     if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
     if (lower.endsWith(".gif")) return "image/gif";
