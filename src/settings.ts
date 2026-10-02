@@ -1,6 +1,7 @@
-import { App, Notice, PluginSettingTab, Setting } from "obsidian";
+import { App, Notice, Platform, PluginSettingTab, Setting } from "obsidian";
 import type FlockSyncPlugin from "./main";
 import { DEFAULT_RELAY_URL } from "./flock-url";
+import { relayUrlProblem } from "./relay-url";
 import { renderQrSvg } from "./pair/qr";
 import type { HostStartInfo } from "./pair/session";
 import type { DeviceRecord } from "./protocol";
@@ -109,12 +110,15 @@ export class FlockSettingTab extends PluginSettingTab {
   // ------------------------------------------------------------------ relay
 
   private renderRelaySetting(containerEl: HTMLElement): void {
+    const desc = Platform.isMobile
+      ? "Must be an https:// Cloudflare Worker. http://127.0.0.1 is your phone, not your PC — pairing will fail."
+      : "Desktop local relay is http://127.0.0.1:8787. Phones need the same https:// Worker URL.";
     new Setting(containerEl)
       .setName("Relay URL")
-      .setDesc("Base URL of the Flock relay. The default points at the bundled/dev relay.")
+      .setDesc(desc)
       .addText((text) =>
         text
-          .setPlaceholder(DEFAULT_RELAY_URL)
+          .setPlaceholder(Platform.isMobile ? "https://flock-relay.your-account.workers.dev" : DEFAULT_RELAY_URL)
           .setValue(this.plugin.data.relayUrl)
           .onChange(async (value) => {
             const url = value.trim() || DEFAULT_RELAY_URL;
@@ -123,6 +127,12 @@ export class FlockSettingTab extends PluginSettingTab {
             await this.plugin.savePluginData();
           })
       );
+
+    const problem = relayUrlProblem(this.plugin.data.relayUrl, Platform.isMobile);
+    if (problem) {
+      const warn = containerEl.createDiv({ cls: "mod-warning flock-relay-warn" });
+      warn.setText(problem);
+    }
   }
 
   // --------------------------------------------------------------- pairing
@@ -132,14 +142,20 @@ export class FlockSettingTab extends PluginSettingTab {
     const wrap = containerEl.createDiv({ cls: "flock-pairing" });
 
     if (pairing.phase === "error") {
-      const err = wrap.createDiv({ cls: "mod-warning" });
+      const err = wrap.createDiv({ cls: "mod-warning flock-pair-error" });
       err.setText(`Pairing error: ${pairing.error ?? "unknown"}`);
-      new Setting(wrap).addButton((btn) =>
-        btn.setButtonText("Dismiss").onClick(() => {
-          pairing.cancel();
-          this.display();
-        })
-      );
+      // Native button: Obsidian Setting buttons can swallow taps on Android.
+      const btn = wrap.createEl("button", {
+        text: "Dismiss",
+        cls: "mod-cta flock-dismiss-btn",
+      });
+      btn.type = "button";
+      btn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        pairing.cancel();
+        this.display();
+      });
       return;
     }
 
@@ -179,11 +195,10 @@ export class FlockSettingTab extends PluginSettingTab {
           btn.setDisabled(true);
           try {
             await this.plugin.pairing.startHost();
-            this.display();
           } catch (e) {
             new Notice(`Pair start failed: ${errMsg(e)}`, 8000);
-            btn.setDisabled(false);
           }
+          this.display();
         })
       );
 

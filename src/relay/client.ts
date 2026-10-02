@@ -1,4 +1,5 @@
-import { requestUrl, type RequestUrlResponse } from "obsidian";
+import { Platform, requestUrl, type RequestUrlResponse } from "obsidian";
+import { explainRelayNetworkError, relayUrlProblem } from "../relay-url";
 import type {
   ApproveDeviceRequest,
   GuestFinishRequest,
@@ -87,13 +88,20 @@ export class RelayHttp {
         if (headers["Content-Type"] === undefined) headers["Content-Type"] = "application/json";
       }
     }
-    const res = await requestUrl({
-      url: this.base + path,
-      method,
-      headers,
-      body: wireBody,
-      throw: false,
-    });
+    const blocked = relayUrlProblem(this.base, Platform.isMobile);
+    if (blocked) throw new RelayError(0, blocked);
+    let res: RequestUrlResponse;
+    try {
+      res = await requestUrl({
+        url: this.base + path,
+        method,
+        headers,
+        body: wireBody,
+        throw: false,
+      });
+    } catch (e) {
+      throw new RelayError(0, explainRelayNetworkError(e, this.base, Platform.isMobile));
+    }
     if (res.status >= 400) throw this.toError(res);
     return res;
   }

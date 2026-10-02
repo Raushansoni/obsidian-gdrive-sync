@@ -149,19 +149,23 @@ export class PairingFlow {
     return this.runId !== runId;
   }
 
-  /** Aborts any running flow. Safe to call multiple times. */
+  /**
+   * Aborts any running flow. Dismiss on an error (or a second cancel) returns
+   * to idle so the settings UI can show Start pair / Join again.
+   */
   cancel(): void {
     this.runId++;
-    if (
-      this.phase !== "idle" &&
-      this.phase !== "done" &&
-      this.phase !== "error" &&
-      this.phase !== "cancelled"
-    ) {
+    if (this.phase === "error" || this.phase === "cancelled") {
+      this.phase = "idle";
+    } else if (this.phase !== "idle" && this.phase !== "done") {
       this.phase = "cancelled";
     }
+    this.error = null;
     this.sessionKey = null;
     this.fingerprint = null;
+    this.host = null;
+    this.guestCode = null;
+    this.hostConfirmRequested = false;
     const resolve = this.hostConfirmResolve;
     this.hostConfirmResolve = null;
     resolve?.();
@@ -176,6 +180,17 @@ export class PairingFlow {
    */
   async startHost(): Promise<HostStartInfo> {
     const runId = this.reset();
+    try {
+      return await this.startHostBody(runId);
+    } catch (e) {
+      if (this.stale(runId)) throw e instanceof Error ? e : new Error(errMsg(e));
+      this.phase = "error";
+      this.error = errMsg(e);
+      throw e instanceof Error ? e : new Error(this.error);
+    }
+  }
+
+  private async startHostBody(runId: number): Promise<HostStartInfo> {
     const keys = await this.identity.ensureDevice();
     const start = await this.relay.pairStart({
       hostDeviceId: keys.deviceId,

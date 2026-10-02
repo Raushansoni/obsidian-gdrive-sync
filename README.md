@@ -29,7 +29,7 @@ npm run dev
 
 Keep that terminal running while you sync. This local relay is all you need for **desktop-to-desktop** sync.
 
-> **Mobile note:** Obsidian on Android/iOS blocks cleartext HTTP, so phones cannot reach `http://127.0.0.1:8787`. Deploying the relay (later, optional) and building the plugin with `FLOCK_RELAY_URL=https://your-worker.example` is how mobile joins the flock. You do **not** need to deploy anything to try desktop sync today — deployment is not required for this milestone.
+> **Phone / `127.0.0.1` error:** On Android or iOS, `http://127.0.0.1:8787` is the **phone itself**, not your PC. Pairing then fails with `ConnectException Failed to connect to /127.0.0.1:8787`. Put an `https://` Worker URL in **Relay URL** on the phone (and the same URL on the PC if you are not using a tunnel in front of local wrangler). Restart Obsidian on the phone if **Dismiss** is stuck on an older build.
 
 To bake a different relay URL into `main.js` at build time:
 
@@ -58,7 +58,10 @@ $env:FLOCK_RELAY_URL="https://your-relay.example"; npm run build
 
 BRAT installs from GitHub **Releases** (`main.js`, `manifest.json`, `styles.css`). Use the latest **v2** release (Flock Sync). Older **v1.x** releases are the previous Google Drive plugin.
 
-Set **Relay URL** in plugin settings. Desktop local relay is `http://127.0.0.1:8787`. A phone needs an `https://` relay — localhost will not work on mobile.
+Set **Relay URL** in plugin settings. Both devices must share a relay the phone can reach:
+
+- Desktop-only: `http://127.0.0.1:8787` (local `wrangler dev`)
+- Phone: an `https://` URL (deployed Worker, or `wrangler dev --tunnel` while the PC stays on)
 
 ### Option B — setup script (this machine)
 

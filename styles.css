@@ -59,6 +59,21 @@
   opacity: 0.8;
 }
 
+.flock-relay-warn,
+.flock-pair-error {
+  margin: 0.5em 0 0.75em;
+  padding: 0.75em 0.9em;
+  border-radius: 8px;
+  white-space: pre-wrap;
+}
+
+.flock-dismiss-btn {
+  display: block;
+  width: 100%;
+  margin: 0 0 1em;
+  padding: 0.7em 1em;
+}
+
 /* ------------------------------------------------------------------ */
 /* Settings: recovery words                                            */
 /* ------------------------------------------------------------------ */
