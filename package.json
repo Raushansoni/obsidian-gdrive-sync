@@ -1,18 +1,21 @@
 {
   "name": "obsidian-gdrive-sync",
-  "version": "1.0.9",
-  "description": "Sync Obsidian vaults across Android, Windows, macOS, and Linux using Google Drive",
+  "version": "2.0.0",
+  "description": "One-click pairing and end-to-end encrypted Obsidian vault sync",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "typecheck": "tsc -noEmit -skipLibCheck",
     "setup": "node scripts/setup.mjs",
     "install-to-vault": "node scripts/install-to-vault.mjs"
   },
   "keywords": [
     "obsidian",
     "plugin",
-    "google-drive",
+    "flock",
+    "pairing",
+    "e2e",
     "sync"
   ],
   "author": "",

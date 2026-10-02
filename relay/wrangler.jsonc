@@ -1,0 +1,34 @@
+{
+  "name": "flock-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-02",
+  "observability": {
+    "enabled": true,
+    "traces": { "enabled": true }
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "PAIRING", "class_name": "PairingRoom" },
+      { "name": "VAULT_LOG", "class_name": "VaultLog" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["PairingRoom", "VaultLog"]
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "BLOBS",
+      "bucket_name": "flock-blobs"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "flock",
+      "database_id": "local-dev-placeholder"
+    }
+  ]
+}

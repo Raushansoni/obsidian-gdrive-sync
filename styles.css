@@ -1,76 +1,76 @@
-.gdrive-sync-status {
+/* ------------------------------------------------------------------ */
+/* Status bar                                                          */
+/* ------------------------------------------------------------------ */
+
+.flock-sync-status {
   cursor: pointer;
 }
 
-.gdrive-sync-status.is-error {
+.flock-sync-status.is-error {
   color: var(--text-error);
 }
 
-.gdrive-sync-status.is-syncing {
+.flock-sync-status.is-syncing {
   color: var(--text-accent);
 }
 
-.gdrive-sync-settings .setting-item-description code {
+.flock-sync-status.is-conflict {
+  color: var(--text-warning, var(--text-accent));
+}
+
+/* ------------------------------------------------------------------ */
+/* Settings: pairing                                                   */
+/* ------------------------------------------------------------------ */
+
+.flock-sync-settings .setting-item-description code {
   font-size: 0.85em;
 }
 
-.gdrive-sync-conn-status {
+/* Card around the nameplate + words + code shown while hosting a pair. */
+.flock-pair-code {
   margin: 0.75em 0 1em;
-  padding: 0.65em 0.85em;
-  border-radius: 6px;
+  padding: 0.9em 0.75em;
   border: 1px solid var(--background-modifier-border);
-  background: var(--background-secondary);
-  font-weight: 600;
-}
-
-.gdrive-sync-conn-status.is-connected {
-  color: var(--text-success, var(--text-accent));
-  border-color: var(--text-success, var(--text-accent));
-}
-
-.gdrive-sync-auth-error {
-  margin: 0 0 1em;
-  padding: 0.65em 0.85em;
-  border-radius: 6px;
-  border: 1px solid var(--text-error);
-  color: var(--text-error);
-  background: var(--background-secondary);
-  font-size: 0.9em;
-}
-
-.gdrive-sync-auth-box {
-  margin-top: 0.5em;
-  padding: 0.75em;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 6px;
-  background: var(--background-secondary);
-}
-
-.gdrive-sync-code-copy {
-  display: block;
-  width: 100%;
-  margin: 0.5em 0 0.75em;
-  padding: 0.85em 0.75em;
-  border: 1px dashed var(--text-accent);
   border-radius: 8px;
-  background: var(--background-primary);
-  color: var(--text-normal);
-  font-family: var(--font-monospace);
-  font-size: 1.45em;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  text-align: center;
-  cursor: pointer;
+  background: var(--background-secondary);
 }
 
-.gdrive-sync-code-copy:active {
-  background: var(--background-modifier-hover);
+.flock-nameplate {
+  color: var(--text-accent);
 }
 
-.gdrive-sync-auth-box textarea {
-  width: 100%;
-  min-height: 4.5em;
-  margin-top: 0.5em;
+.flock-words {
   font-family: var(--font-monospace);
-  font-size: 0.85em;
+}
+
+/* QR is centered by .flock-qr-wrap inline styles; make the svg behave. */
+.flock-qr-wrap svg {
+  display: block;
+}
+
+/* Three check words compared on both devices. */
+.flock-fp-word {
+  font-family: var(--font-monospace);
+  letter-spacing: 0.04em;
+  color: var(--text-accent);
+}
+
+.flock-pair-status {
+  opacity: 0.8;
+}
+
+/* ------------------------------------------------------------------ */
+/* Settings: recovery words                                            */
+/* ------------------------------------------------------------------ */
+
+.flock-recovery-box pre {
+  font-size: 0.95em;
+  line-height: 1.6;
+}
+
+/* The "Copy words" button lives inside the box; drop its top border. */
+.flock-recovery-box .setting-item {
+  border-top: none;
+  padding-top: 0.25em;
+  padding-bottom: 0.25em;
 }

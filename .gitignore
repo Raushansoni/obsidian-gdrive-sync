@@ -37,3 +37,8 @@ Desktop.ini
 dist/
 *.tgz
 obsidian-gdrive-sync.zip
+
+# Local Cloudflare relay state
+relay/node_modules/
+relay/.wrangler/
+relay/.dev.vars

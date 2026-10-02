@@ -1,96 +1,30 @@
-import { App, PluginSettingTab, Setting, Notice, Platform } from "obsidian";
-import type GDriveSyncPlugin from "./main";
-import {
-  BUNDLED_CLIENT_ID,
-  BUNDLED_CLIENT_SECRET,
-  BUNDLED_REDIRECT_URI,
-} from "./bundled-oauth";
+import { App, Notice, PluginSettingTab, Setting } from "obsidian";
+import type FlockSyncPlugin from "./main";
+import { DEFAULT_RELAY_URL } from "./flock-url";
+import { renderQrSvg } from "./pair/qr";
+import type { HostStartInfo } from "./pair/session";
+import type { DeviceRecord } from "./protocol";
 
-export interface TokenSet {
-  accessToken: string;
-  refreshToken: string;
-  expiresAt: number;
-  tokenType: string;
-  scope?: string;
+/** Minimal structural view of StatusMachine so this file compiles independently. */
+interface StatusLike {
+  state: string;
+  detail?: string | null;
+  lastSyncAt?: number | null;
 }
 
-/** Survives mobile WebView pause/kill so we can finish after Google Allow. */
-export interface PendingDeviceAuth {
-  deviceCode: string;
-  userCode: string;
-  verificationUrl: string;
-  expiresAt: number;
-  intervalMs: number;
+function errMsg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
-export interface SyncIndexEntry {
-  driveFileId: string;
-  hash: string;
-  mtime: number;
-  size: number;
-}
-
-export interface SyncIndex {
-  version: 1;
-  files: Record<string, SyncIndexEntry>;
-  changeToken?: string;
-  remoteFolderId?: string;
-  remoteRootId?: string;
-}
-
-export interface GDriveSyncSettings {
-  clientId: string;
-  clientSecret: string;
-  /** Desktop loopback redirect — must match an Authorized redirect URI. */
-  redirectUri: string;
-  /** Persisted across app switches so token exchange uses the same redirect_uri. */
-  pendingOAuthRedirectUri: string;
-  /** In-progress device-code login (mobile). Cleared on success/expiry. */
-  pendingDeviceAuth: PendingDeviceAuth | null;
-  /** Last connect failure shown in settings (Google UI can succeed while this fails). */
-  lastAuthError: string | null;
-  tokens: TokenSet | null;
-  remoteFolderName: string;
-  remoteFolderId: string;
-  syncIntervalSeconds: number;
-  autoSync: boolean;
-  ignorePatterns: string;
-  syncIndex: SyncIndex;
-  lastSyncAt: number | null;
-  lastError: string | null;
-}
-
-export const DEFAULT_IGNORE = [
-  ".obsidian/workspace",
-  ".obsidian/workspace.json",
-  ".obsidian/workspace-mobile.json",
-  ".obsidian/workspaces.json",
-  ".obsidian/cache",
-  ".obsidian/plugins/obsidian-gdrive-sync/data.json",
-  ".trash",
-  ".git",
-  ".DS_Store",
-  "desktop.ini",
-  "Thumbs.db",
-].join("\n");
-
-export const DEFAULT_SETTINGS: GDriveSyncSettings = {
-  clientId: BUNDLED_CLIENT_ID,
-  clientSecret: BUNDLED_CLIENT_SECRET,
-  redirectUri: BUNDLED_REDIRECT_URI,
-  pendingOAuthRedirectUri: "",
-  pendingDeviceAuth: null,
-  lastAuthError: null,
-  tokens: null,
-  remoteFolderName: "",
-  remoteFolderId: "",
-  syncIntervalSeconds: 30,
-  autoSync: true,
-  ignorePatterns: DEFAULT_IGNORE,
-  syncIndex: { version: 1, files: {} },
-  lastSyncAt: null,
-  lastError: null,
-};
+/** Pairing phases during which the host/guest panel replaces the main sections. */
+const ACTIVE_PAIRING_PHASES = new Set<string>([
+  "host-waiting-guest",
+  "host-confirm",
+  "host-finishing",
+  "guest-joining",
+  "guest-confirm",
+  "guest-finishing",
+]);
 
 async function copyText(text: string): Promise<boolean> {
   try {
@@ -118,312 +52,557 @@ async function copyText(text: string): Promise<boolean> {
 }
 
 /**
- * Prefer build-time OAuth client. Official releases bake the TVs/Limited-Input client
- * required for mobile device-code auth. Stale Desktop client IDs in data.json cause
- * invalid_client / "Invalid client type" on Connect.
+ * Flock Sync settings: relay URL, device pairing (host + guest), vault linking,
+ * flock device management, recovery words, and sync behavior.
+ * No Google OAuth — Flock Sync uses device pairing only.
  */
-export function applyBundledOAuthDefaults(settings: GDriveSyncSettings): void {
-  if (BUNDLED_CLIENT_ID) {
-    settings.clientId = BUNDLED_CLIENT_ID;
-  }
-  if (BUNDLED_CLIENT_SECRET) {
-    settings.clientSecret = BUNDLED_CLIENT_SECRET;
-  }
-  if (!settings.redirectUri?.trim() && BUNDLED_REDIRECT_URI) {
-    settings.redirectUri = BUNDLED_REDIRECT_URI;
-  }
-  // Older builds used http://localhost:42813/ which can CONNECTION_REFUSED via IPv6.
-  if (/^http:\/\/localhost:42813\/?$/i.test(settings.redirectUri?.trim() || "")) {
-    settings.redirectUri = BUNDLED_REDIRECT_URI || "http://127.0.0.1:42813/";
-  }
-  // Drop obsolete GitHub Pages mobile HTTPS callback (device-code flow replaced it).
-  delete (settings as { mobileRedirectUri?: string }).mobileRedirectUri;
-}
+export class FlockSettingTab extends PluginSettingTab {
+  plugin: FlockSyncPlugin;
 
-export class GDriveSyncSettingTab extends PluginSettingTab {
-  plugin: GDriveSyncPlugin;
+  private pairingPoll: ReturnType<typeof setInterval> | null = null;
+  private lastPairingSnapshot = "";
+  private joinCodeDraft = "";
 
-  constructor(app: App, plugin: GDriveSyncPlugin) {
+  constructor(app: App, plugin: FlockSyncPlugin) {
     super(app, plugin);
     this.plugin = plugin;
   }
 
   hide(): void {
+    this.stopPairingPoll();
     if (this.plugin.refreshSettingsTab === this.redisplay) {
       this.plugin.refreshSettingsTab = null;
     }
   }
 
   private redisplay = (): void => {
-    // Only rebuild while this tab’s DOM is still mounted.
+    // Only rebuild while this tab's DOM is still mounted.
     if (this.containerEl?.isConnected) this.display();
   };
 
   display(): void {
+    this.stopPairingPoll();
     const { containerEl } = this;
     this.plugin.refreshSettingsTab = this.redisplay;
     containerEl.empty();
-    containerEl.addClass("gdrive-sync-settings");
+    containerEl.addClass("flock-sync-settings");
 
-    containerEl.createEl("h2", { text: "Google Drive Sync" });
+    containerEl.createEl("h2", { text: "Flock Sync" });
     containerEl.createEl("p", {
-      text: "Sync this vault across Android, Windows, macOS, and Linux with the same Google account and remote folder name.",
+      text: "End-to-end encrypted vault sync across your devices. Pair devices once, then link vaults.",
     });
 
-    if (BUNDLED_CLIENT_ID && this.plugin.settings.clientId?.trim() === BUNDLED_CLIENT_ID) {
-      containerEl.createEl("p", {
-        text: "OAuth Client ID is pre-filled from the plugin build. Tap Connect Google below (no need to paste it first).",
-      });
-    }
+    this.renderRelaySetting(containerEl);
 
-    new Setting(containerEl)
-      .setName("Google OAuth Client ID")
-      .setDesc(
-        BUNDLED_CLIENT_ID
-          ? "Pre-filled for this build. Leave as-is unless you use your own Google Cloud client."
-          : "From Google Cloud Console → APIs & Services → Credentials (Desktop or Web client)."
-      )
-      .addText((text) =>
-        text
-          .setPlaceholder("xxxxx.apps.googleusercontent.com")
-          .setValue(this.plugin.settings.clientId)
-          .onChange(async (value) => {
-            this.plugin.settings.clientId = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Google OAuth Client Secret")
-      .setDesc("Required for Web clients. Desktop clients often leave this empty.")
-      .addText((text) =>
-        text
-          .setPlaceholder("GOCSPX-...")
-          .setValue(this.plugin.settings.clientSecret)
-          .onChange(async (value) => {
-            this.plugin.settings.clientSecret = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Desktop redirect URI")
-      .setDesc("Loopback for PC/Mac. Must be allowed on your Google OAuth client. Mobile uses device-code login (no redirect URI).")
-      .addText((text) =>
-        text
-          .setPlaceholder("http://127.0.0.1:42813/")
-          .setValue(this.plugin.settings.redirectUri)
-          .onChange(async (value) => {
-            this.plugin.settings.redirectUri = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
-
-    const connected = !!this.plugin.settings.tokens?.refreshToken;
-    const pending = this.plugin.settings.pendingDeviceAuth;
-    // Restore UI from disk if in-memory deviceAuth was lost (WebView restart).
-    if (!this.plugin.deviceAuth && pending && Date.now() < pending.expiresAt && !connected) {
-      this.plugin.deviceAuth = {
-        userCode: pending.userCode,
-        verificationUrl: pending.verificationUrl,
-        phase: "waiting",
-      };
-    }
-
-    const statusEl = containerEl.createDiv({ cls: "gdrive-sync-conn-status" });
-    if (connected) {
-      statusEl.addClass("is-connected");
-      statusEl.setText("Status: Connected to Google Drive");
-    } else if (this.plugin.deviceAuth?.phase === "checking") {
-      statusEl.addClass("is-waiting");
-      statusEl.setText("Status: Checking Google approval… stay in Obsidian");
-    } else if (this.plugin.deviceAuth || pending) {
-      statusEl.addClass("is-waiting");
-      statusEl.setText("Status: Waiting for you to Allow access in Google");
+    // While a pairing flow is in flight (first pair OR "add another device"),
+    // show the host/guest panel even though this device may already be paired.
+    const pairingActive = ACTIVE_PAIRING_PHASES.has(this.plugin.pairing.phase);
+    if (this.plugin.identity.hasFlock() && !pairingActive) {
+      this.renderPairedSection(containerEl);
     } else {
-      statusEl.setText("Status: Not connected");
+      this.renderPairingSection(containerEl);
     }
 
-    if (this.plugin.settings.lastAuthError && !connected) {
-      const err = containerEl.createDiv({ cls: "gdrive-sync-auth-error" });
-      err.setText(`Last connect error: ${this.plugin.settings.lastAuthError}`);
-    }
+    this.renderSyncBehavior(containerEl);
+  }
 
+  // ------------------------------------------------------------------ relay
+
+  private renderRelaySetting(containerEl: HTMLElement): void {
     new Setting(containerEl)
-      .setName("Google account")
-      .setDesc(
-        connected
-          ? "Connected. Use the same Google account on every device."
-          : Platform.isMobile
-            ? "Tap Connect → copy code → Allow at google.com/device → return here (no redirect). Then tap “I allowed access”."
-            : "Desktop opens the browser automatically; falls back to device code if needed."
-      )
-      .addButton((btn) =>
-        btn
-          .setButtonText(connected ? "Reconnect" : "Connect Google")
-          .setCta()
-          .setDisabled(!!this.plugin.deviceAuth && !connected)
-          .onClick(async () => {
-            try {
-              await this.plugin.connectGoogle();
-              this.display();
-            } catch (e) {
-              new Notice(`Connect failed: ${String(e)}`, 12000);
-              this.display();
-            }
-          })
-      )
-      .addButton((btn) =>
-        btn
-          .setButtonText("Disconnect")
-          .setDisabled(!connected)
-          .onClick(async () => {
-            await this.plugin.disconnectGoogle();
-            new Notice("Disconnected from Google");
-            this.display();
+      .setName("Relay URL")
+      .setDesc("Base URL of the Flock relay. The default points at the bundled/dev relay.")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_RELAY_URL)
+          .setValue(this.plugin.data.relayUrl)
+          .onChange(async (value) => {
+            const url = value.trim() || DEFAULT_RELAY_URL;
+            this.plugin.data.relayUrl = url;
+            this.plugin.relay.setBase(url);
+            await this.plugin.savePluginData();
           })
       );
+  }
 
-    if (this.plugin.deviceAuth) {
-      const userCode = this.plugin.deviceAuth.userCode;
-      const box = containerEl.createDiv({ cls: "gdrive-sync-auth-box" });
-      box.createEl("h3", {
-        text:
-          this.plugin.deviceAuth.phase === "checking"
-            ? "Almost done — confirming…"
-            : "Finish Google sign-in",
-      });
-      box.createEl("p", {
-        text: "1. Tap the code below to copy it",
-      });
-      const codeBtn = box.createEl("button", {
-        cls: "gdrive-sync-code-copy",
-        text: userCode,
-        attr: { type: "button", "aria-label": "Copy device code" },
-      });
-      codeBtn.addEventListener("click", async () => {
-        const ok = await copyText(userCode);
-        new Notice(ok ? `Copied ${userCode}` : "Could not copy — long-press the code", 4000);
-      });
-      box.createEl("p", {
-        text: "2. Open google.com/device, paste the code, tap Allow, then return here. Google will not send you back — that is normal.",
-      });
-      new Setting(box)
-        .addButton((btn) =>
-          btn.setButtonText("Copy code").onClick(async () => {
-            const ok = await copyText(userCode);
-            new Notice(ok ? `Copied ${userCode}` : "Could not copy — long-press the code", 4000);
-          })
-        )
-        .addButton((btn) =>
-          btn.setButtonText("Open google.com/device").setCta().onClick(() => {
-            if (this.plugin.deviceAuth) {
-              this.plugin.deviceAuth = {
-                ...this.plugin.deviceAuth,
-                phase: "waiting",
-              };
-            }
-            window.open(this.plugin.deviceAuth!.verificationUrl);
-          })
-        );
-      new Setting(box).addButton((btn) =>
-        btn.setButtonText("I allowed access — check now").setCta().onClick(async () => {
-          if (this.plugin.deviceAuth) {
-            this.plugin.deviceAuth = {
-              ...this.plugin.deviceAuth,
-              phase: "checking",
-            };
-            this.display();
-          }
-          new Notice("Checking Google…", 4000);
-          await this.plugin.checkDeviceAuthNow();
+  // --------------------------------------------------------------- pairing
+
+  private renderPairingSection(containerEl: HTMLElement): void {
+    const pairing = this.plugin.pairing;
+    const wrap = containerEl.createDiv({ cls: "flock-pairing" });
+
+    if (pairing.phase === "error") {
+      const err = wrap.createDiv({ cls: "mod-warning" });
+      err.setText(`Pairing error: ${pairing.error ?? "unknown"}`);
+      new Setting(wrap).addButton((btn) =>
+        btn.setButtonText("Dismiss").onClick(() => {
+          pairing.cancel();
           this.display();
         })
       );
+      return;
     }
 
-    new Setting(containerEl)
-      .setName("Remote folder name")
-      .setDesc(
-        "Folder under Drive → ObsidianVaults/. Use the exact same name on every device for this vault."
-      )
+    switch (pairing.phase) {
+      case "host-waiting-guest":
+      case "host-confirm":
+      case "host-finishing":
+        if (pairing.host) {
+          this.renderHostPanel(wrap, pairing.host);
+          return;
+        }
+        break;
+      case "guest-joining":
+      case "guest-confirm":
+      case "guest-finishing":
+        this.renderGuestPanel(wrap);
+        return;
+      default:
+        break;
+    }
+
+    if (pairing.phase === "cancelled") {
+      wrap.createEl("p", { text: "Pairing cancelled." });
+    }
+
+    const choose = wrap.createDiv({ cls: "flock-pair-choose" });
+    choose.createEl("h3", { text: "Pair a device" });
+    choose.createEl("p", {
+      text: "Pair this device with your phone or another computer. Pairing is end-to-end encrypted; compare the three check words on both screens before confirming.",
+    });
+
+    new Setting(choose)
+      .setName("Start pairing")
+      .setDesc("Show a nameplate, two words and a QR here. Enter them on the other device.")
+      .addButton((btn) =>
+        btn.setButtonText("Start pair").setCta().onClick(async () => {
+          btn.setDisabled(true);
+          try {
+            await this.plugin.pairing.startHost();
+            this.display();
+          } catch (e) {
+            new Notice(`Pair start failed: ${errMsg(e)}`, 8000);
+            btn.setDisabled(false);
+          }
+        })
+      );
+
+    new Setting(choose)
+      .setName("I have a code")
+      .setDesc("Paste the code shown on the other device (e.g. 123-able-acid).")
       .addText((text) =>
         text
-          .setPlaceholder(this.app.vault.getName())
-          .setValue(this.plugin.settings.remoteFolderName)
-          .onChange(async (value) => {
-            this.plugin.settings.remoteFolderName = value.trim();
-            this.plugin.settings.remoteFolderId = "";
-            this.plugin.settings.syncIndex.remoteFolderId = undefined;
-            await this.plugin.saveSettings();
-          })
+          .setPlaceholder("123-able-acid")
+          .setValue(this.joinCodeDraft)
+          .onChange((value) => (this.joinCodeDraft = value))
+      )
+      .addButton((btn) =>
+        btn.setButtonText("Join").onClick(async () => {
+          const code = this.joinCodeDraft.trim();
+          if (!code) {
+            new Notice("Enter the pairing code first");
+            return;
+          }
+          btn.setDisabled(true);
+          const fingerprint = await this.plugin.pairing.join(code);
+          btn.setDisabled(false);
+          const pairing = this.plugin.pairing;
+          if (!fingerprint || pairing.phase === "error") {
+            new Notice(
+              `Join failed: ${pairing.error ?? "no fingerprint — check the code and try again"}`,
+              8000
+            );
+          }
+          this.display();
+        })
       );
+  }
+
+  private renderHostPanel(wrap: HTMLElement, host: HostStartInfo): void {
+    const pairing = this.plugin.pairing;
+
+    wrap.createEl("h3", { text: "Pairing — enter this on your other device" });
+
+    const codeBox = wrap.createDiv({ cls: "flock-pair-code" });
+    const nameplateEl = codeBox.createDiv({ cls: "flock-nameplate" });
+    nameplateEl.setText(host.nameplate);
+    nameplateEl.setAttribute(
+      "style",
+      "font-size:2.4em;font-weight:700;letter-spacing:0.15em;text-align:center"
+    );
+    const wordsEl = codeBox.createDiv({ cls: "flock-words" });
+    wordsEl.setText(host.words.join("  ·  "));
+    wordsEl.setAttribute("style", "font-size:1.4em;text-align:center;margin:4px 0 2px");
+    const fullEl = codeBox.createDiv({ cls: "flock-code-full" });
+    fullEl.setText(host.code);
+    fullEl.setAttribute("style", "text-align:center;font-family:monospace;opacity:0.8");
+
+    const qrWrap = wrap.createDiv({ cls: "flock-qr-wrap" });
+    qrWrap.setAttribute("style", "display:flex;justify-content:center;margin:10px 0");
+    qrWrap.innerHTML = renderQrSvg(host.link);
+
+    new Setting(wrap).addButton((btn) =>
+      btn.setButtonText("Copy code").onClick(async () => {
+        const ok = await copyText(host.code);
+        new Notice(ok ? "Code copied" : "Could not copy — write it down instead", 3000);
+      })
+    );
+
+    const fpEl = wrap.createDiv({ cls: "flock-fingerprint" });
+    if (pairing.fingerprint) {
+      this.renderFingerprint(fpEl, pairing.fingerprint);
+      fpEl.createEl("p", {
+        text: "These three words also appear on the other device. They must match exactly.",
+      });
+    }
+
+    const statusText =
+      pairing.phase === "host-finishing"
+        ? "Finishing…"
+        : pairing.fingerprint
+          ? "Waiting for you to confirm."
+          : "Waiting for the other device to enter the code…";
+    wrap.createEl("p", { cls: "flock-pair-status", text: statusText });
+
+    new Setting(wrap)
+      .setName("Confirm pairing")
+      .setDesc("Only tap Pair after the three words match on both screens.")
+      .addButton((btn) => {
+        btn
+          .setButtonText(pairing.phase === "host-finishing" ? "Finishing…" : "Pair")
+          .setCta()
+          .setDisabled(!pairing.fingerprint || pairing.phase === "host-finishing");
+        btn.onClick(async () => {
+          btn.setButtonText("Finishing…").setDisabled(true);
+          try {
+            await this.plugin.pairing.confirmHost();
+            // Identity was persisted by setFlock() in the session; restart the
+            // poll timer and repaint so the paired section appears.
+            this.plugin.restartAutoSync();
+            new Notice(
+              this.plugin.data.enrolled
+                ? "Paired! The new device has joined your flock."
+                : "Paired! Now link this vault.",
+              6000
+            );
+          } catch (e) {
+            new Notice(`Pairing failed: ${errMsg(e)}`, 8000);
+          }
+          this.display();
+        });
+      });
+
+    new Setting(wrap).addButton((btn) =>
+      btn.setButtonText("Cancel").onClick(() => {
+        this.plugin.pairing.cancel();
+        this.display();
+      })
+    );
+
+    this.startPairingPoll();
+  }
+
+  private renderGuestPanel(wrap: HTMLElement): void {
+    const pairing = this.plugin.pairing;
+
+    wrap.createEl("h3", { text: "Joining a flock" });
+
+    if (pairing.phase === "guest-confirm" && pairing.fingerprint) {
+      this.renderFingerprint(wrap, pairing.fingerprint);
+      wrap.createEl("p", {
+        text: "Compare these three words with the host device. They must match exactly.",
+      });
+      new Setting(wrap)
+        .setName("Confirm pairing")
+        .setDesc("Tap Pair only if the words match on both screens.")
+        .addButton((btn) =>
+          btn.setButtonText("Pair").setCta().onClick(async () => {
+            btn.setButtonText("Joining…").setDisabled(true);
+            try {
+              await this.plugin.pairing.confirmGuest();
+              // Identity was persisted by setFlock() in the session; restart
+              // the poll timer and repaint so the paired section appears.
+              this.plugin.restartAutoSync();
+              new Notice(
+                this.plugin.data.enrolled
+                  ? "Paired! The new device has joined your flock."
+                  : "Paired! Now link this vault.",
+                6000
+              );
+            } catch (e) {
+              new Notice(`Pairing failed: ${errMsg(e)}`, 8000);
+            }
+            this.display();
+          })
+        );
+    } else {
+      const text =
+        pairing.phase === "guest-finishing" ? "Joining…" : "Connecting to the host…";
+      wrap.createEl("p", { cls: "flock-pair-status", text });
+    }
+
+    new Setting(wrap).addButton((btn) =>
+      btn.setButtonText("Cancel").onClick(() => {
+        this.plugin.pairing.cancel();
+        this.display();
+      })
+    );
+
+    this.startPairingPoll();
+  }
+
+  private renderFingerprint(parent: HTMLElement, fingerprint: string): void {
+    const box = parent.createDiv({ cls: "flock-fp-box" });
+    box.setAttribute(
+      "style",
+      "display:flex;gap:12px;justify-content:center;margin:10px 0;padding:10px;border:1px solid var(--background-modifier-border);border-radius:8px"
+    );
+    for (const word of fingerprint.split("-")) {
+      const span = box.createSpan({ cls: "flock-fp-word", text: word });
+      span.setAttribute("style", "font-size:1.5em;font-weight:600");
+    }
+  }
+
+  // ----------------------------------------------------------------- paired
+
+  private renderPairedSection(containerEl: HTMLElement): void {
+    const plugin = this.plugin;
+    const wrap = containerEl.createDiv({ cls: "flock-paired" });
+
+    if (!plugin.data.enrolled) {
+      wrap.createEl("h3", { text: "This device is paired." });
+      wrap.createEl("p", {
+        text: `Flock ID: ${plugin.identity.flockId ?? "—"}`,
+      });
+      wrap.createEl("p", {
+        text: "Link this vault to start syncing it with the flock. You can link several vaults.",
+      });
+      new Setting(wrap)
+        .setName("Vault")
+        .setDesc(plugin.app.vault.getName() || "This vault")
+        .addButton((btn) =>
+          btn.setButtonText("Link this vault").setCta().onClick(async () => {
+            await plugin.linkVault();
+          })
+        );
+      this.renderAddAnotherDevice(wrap);
+      this.renderRecoveryWords(wrap);
+      return;
+    }
+
+    wrap.createEl("h3", { text: "This vault is linked." });
+
+    const status = (plugin as unknown as { status?: StatusLike }).status;
+    const stateLine = status
+      ? `Status: ${status.state}${status.detail ? ` — ${status.detail}` : ""}`
+      : "Status: ready";
+    wrap.createEl("p", { text: stateLine });
+    wrap.createEl("p", {
+      text: plugin.data.lastSyncAt
+        ? `Last sync: ${new Date(plugin.data.lastSyncAt).toLocaleString()}`
+        : "Last sync: never",
+    });
+    if (plugin.data.lastError) {
+      wrap.createEl("p", { cls: "mod-warning", text: `Last error: ${plugin.data.lastError}` });
+    }
+    if (plugin.data.vaultId) {
+      wrap.createEl("p", { text: `Vault ID: ${plugin.data.vaultId}` });
+    }
+
+    this.renderAddAnotherDevice(wrap);
+    this.renderDevices(wrap);
+    this.renderRecoveryWords(wrap);
+  }
+
+  /**
+   * Add-device flow for an already-paired device: startHost() reuses the
+   * existing flock (no re-key) and shows the same host QR/code panel.
+   */
+  private renderAddAnotherDevice(wrap: HTMLElement): void {
+    new Setting(wrap)
+      .setName("Add another device")
+      .setDesc(
+        "Pair one more phone or computer into this flock. It joins with the same flock secret — nothing is re-keyed."
+      )
+      .addButton((btn) =>
+        btn.setButtonText("Add device").onClick(async () => {
+          btn.setDisabled(true);
+          try {
+            await this.plugin.pairing.startHost();
+          } catch (e) {
+            new Notice(`Pair start failed: ${errMsg(e)}`, 8000);
+            btn.setDisabled(false);
+            return;
+          }
+          this.display();
+        })
+      );
+  }
+
+  private renderDevices(wrap: HTMLElement): void {
+    const sec = wrap.createDiv({ cls: "flock-devices" });
+    sec.createEl("h4", { text: "Devices in this flock" });
+    const listEl = sec.createDiv();
+    listEl.setText("Loading…");
+
+    void (async () => {
+      try {
+        const info = await this.plugin.relay.flock();
+        if (!this.containerEl?.isConnected) return;
+        listEl.empty();
+        const me = this.plugin.identity.deviceId;
+        const devices: DeviceRecord[] = info.devices ?? [];
+        if (!devices.length) {
+          listEl.setText("No devices reported by the relay yet.");
+        }
+        for (const d of devices) {
+          const row = new Setting(listEl);
+          row.setName(d.displayName || d.deviceId.slice(0, 12));
+          row.setDesc(
+            d.revoked
+              ? `revoked · ${d.deviceId}`
+              : d.deviceId === me
+                ? "this device"
+                : d.deviceId
+          );
+          if (!d.revoked && d.deviceId !== me) {
+            row.addButton((btn) =>
+              btn.setButtonText("Revoke").onClick(async () => {
+                btn.setDisabled(true);
+                try {
+                  await this.plugin.relay.revokeDevice(d.deviceId);
+                  new Notice("Device revoked");
+                } catch (e) {
+                  new Notice(`Revoke failed: ${errMsg(e)}`, 8000);
+                }
+                this.display();
+              })
+            );
+          }
+        }
+        const vaults = info.vaults ?? [];
+        sec.createEl("p", {
+          text: `Vaults in flock: ${vaults.length}`,
+        });
+      } catch (e) {
+        if (!this.containerEl?.isConnected) return;
+        listEl.empty();
+        const warn = listEl.createEl("span", { cls: "mod-warning" });
+        warn.setText(`Could not load devices: ${errMsg(e)}`);
+      }
+    })();
+  }
+
+  private renderRecoveryWords(wrap: HTMLElement): void {
+    const words = this.plugin.identity.recoveryWords();
+    if (!words) return;
+    const all = words.split(" ").filter(Boolean);
+    const lines: string[] = [];
+    for (let i = 0; i < all.length; i += 8) lines.push(all.slice(i, i + 8).join(" "));
+
+    const sec = wrap.createDiv({ cls: "flock-recovery" });
+    sec.createEl("h4", { text: "Recovery words" });
+    sec.createEl("p", {
+      text: "These 32 words can restore your flock secret on a new device. Write them down and keep them somewhere safe — this is the only place they are shown.",
+    });
+    const box = sec.createDiv({ cls: "flock-recovery-box" });
+    box.setAttribute(
+      "style",
+      "background:var(--background-secondary);border:1px solid var(--background-modifier-border);border-radius:8px;padding:10px;margin:6px 0"
+    );
+    box.createEl("pre", {
+      text: lines.join("\n"),
+      attr: { style: "margin:0;font-family:var(--font-monospace);white-space:pre-wrap" },
+    });
+    new Setting(box).addButton((btn) =>
+      btn.setButtonText("Copy words").onClick(async () => {
+        const ok = await copyText(words);
+        new Notice(ok ? "Recovery words copied" : "Could not copy — select the text manually", 3000);
+      })
+    );
+  }
+
+  // --------------------------------------------------------- sync behavior
+
+  private renderSyncBehavior(containerEl: HTMLElement): void {
+    const plugin = this.plugin;
+    containerEl.createEl("h3", { text: "Sync" });
 
     new Setting(containerEl)
       .setName("Auto sync")
-      .setDesc("Watch local changes and poll Google Drive on an interval.")
+      .setDesc("Poll and push changes in the background while Obsidian is open.")
       .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.autoSync).onChange(async (value) => {
-          this.plugin.settings.autoSync = value;
-          await this.plugin.saveSettings();
-          this.plugin.restartAutoSync();
+        toggle.setValue(plugin.data.autoSync).onChange(async (value) => {
+          plugin.data.autoSync = value;
+          await plugin.savePluginData();
+          plugin.restartAutoSync();
         })
       );
 
     new Setting(containerEl)
       .setName("Sync interval (seconds)")
-      .setDesc("How often to pull remote changes. Minimum 15.")
+      .setDesc("How often auto sync runs. Minimum 15.")
       .addText((text) =>
         text
-          .setPlaceholder("30")
-          .setValue(String(this.plugin.settings.syncIntervalSeconds))
+          .setPlaceholder("20")
+          .setValue(String(plugin.data.syncIntervalSeconds))
           .onChange(async (value) => {
             const n = Number(value);
             if (!Number.isFinite(n) || n < 15) return;
-            this.plugin.settings.syncIntervalSeconds = Math.floor(n);
-            await this.plugin.saveSettings();
-            this.plugin.restartAutoSync();
+            plugin.data.syncIntervalSeconds = Math.floor(n);
+            await plugin.savePluginData();
+            plugin.restartAutoSync();
           })
       );
 
     new Setting(containerEl)
       .setName("Ignore patterns")
-      .setDesc("One path prefix or exact relative path per line. Matched files are never synced.")
+      .setDesc("One vault path per line. Matched files are never synced.")
       .addTextArea((area) => {
-        area.setValue(this.plugin.settings.ignorePatterns).onChange(async (value) => {
-          this.plugin.settings.ignorePatterns = value;
-          await this.plugin.saveSettings();
+        area.setValue(plugin.data.ignorePatterns).onChange(async (value) => {
+          plugin.data.ignorePatterns = value;
+          await plugin.savePluginData();
         });
         area.inputEl.rows = 8;
         area.inputEl.cols = 40;
       });
 
-    new Setting(containerEl)
-      .setName("Actions")
-      .addButton((btn) =>
-        btn.setButtonText("Sync now").setCta().onClick(async () => {
-          await this.plugin.syncNow();
-        })
-      )
-      .addButton((btn) =>
-        btn.setButtonText("Reset sync index").onClick(async () => {
-          this.plugin.settings.syncIndex = { version: 1, files: {} };
-          this.plugin.settings.remoteFolderId = "";
-          await this.plugin.saveSettings();
-          new Notice("Sync index reset. Next sync will rebuild mapping.");
-        })
-      );
+    new Setting(containerEl).setName("Actions").addButton((btn) =>
+      btn.setButtonText("Sync now").setCta().onClick(async () => {
+        await plugin.syncNow();
+        if (this.containerEl?.isConnected) this.display();
+      })
+    );
+  }
 
-    if (this.plugin.settings.lastSyncAt) {
-      containerEl.createEl("p", {
-        text: `Last sync: ${new Date(this.plugin.settings.lastSyncAt).toLocaleString()}`,
-      });
+  // -------------------------------------------------------------- polling
+
+  /** Re-render while a pairing panel is up so fingerprint/phase changes appear. */
+  private startPairingPoll(): void {
+    this.stopPairingPoll();
+    this.lastPairingSnapshot = this.pairingSnapshot();
+    this.pairingPoll = setInterval(() => {
+      if (!this.containerEl?.isConnected) {
+        this.stopPairingPoll();
+        return;
+      }
+      const snap = this.pairingSnapshot();
+      if (snap !== this.lastPairingSnapshot) {
+        this.lastPairingSnapshot = snap;
+        this.display();
+      }
+    }, 700);
+  }
+
+  private stopPairingPoll(): void {
+    if (this.pairingPoll) {
+      clearInterval(this.pairingPoll);
+      this.pairingPoll = null;
     }
-    if (this.plugin.settings.lastError) {
-      containerEl.createEl("p", {
-        cls: "mod-warning",
-        text: `Last error: ${this.plugin.settings.lastError}`,
-      });
-    }
+  }
+
+  private pairingSnapshot(): string {
+    const p = this.plugin.pairing;
+    return `${p.phase}|${p.fingerprint ?? ""}|${p.error ?? ""}|${p.host?.code ?? ""}`;
   }
 }

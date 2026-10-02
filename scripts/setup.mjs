@@ -100,45 +100,78 @@ function enablePlugin(vaultPath) {
   }
 }
 
-function parseCredentialsFile(filePath) {
-  const raw = JSON.parse(fs.readFileSync(filePath, "utf8"));
-  const block = raw.installed || raw.web || raw;
-  const clientId = block.client_id || block.clientId;
-  const clientSecret = block.client_secret || block.clientSecret || "";
-  if (!clientId) {
-    throw new Error(`No client_id found in ${filePath}`);
-  }
-  const redirects = block.redirect_uris || block.redirectUris || [];
-  return { clientId, clientSecret, redirects };
+const FLOCK_KEYS = [
+  "relayUrl",
+  "vaultId",
+  "enrolled",
+  "autoSync",
+  "syncIntervalSeconds",
+  "ignorePatterns",
+  "lastSyncAt",
+  "lastError",
+  "statusLog",
+  "localCursor",
+  "pathTips",
+  "lastHlc",
+];
+
+function looksLikeLegacyDrive(data) {
+  return (
+    data &&
+    typeof data === "object" &&
+    ("tokens" in data ||
+      "syncIndex" in data ||
+      "clientId" in data ||
+      "clientSecret" in data ||
+      "remoteFolderId" in data ||
+      "pendingOAuthRedirectUri" in data)
+  );
 }
 
-function writePluginSettings(vaultPath, creds) {
+/** Keep only Flock fields. Drive OAuth tokens / syncIndex never survive install. */
+function toFlockData(parsed, relayUrl) {
+  const src = parsed && typeof parsed === "object" ? parsed : {};
+  const legacy = looksLikeLegacyDrive(src);
+  const interval = Number(src.syncIntervalSeconds);
+  const out = {
+    relayUrl: relayUrl || (typeof src.relayUrl === "string" && src.relayUrl.trim()) || undefined,
+    vaultId: legacy ? null : typeof src.vaultId === "string" ? src.vaultId : null,
+    enrolled: legacy ? false : src.enrolled === true,
+    autoSync: src.autoSync !== false,
+    syncIntervalSeconds: Number.isFinite(interval) && interval >= 15 ? Math.floor(interval) : 20,
+    ignorePatterns: typeof src.ignorePatterns === "string" ? src.ignorePatterns : undefined,
+    lastSyncAt: legacy ? null : typeof src.lastSyncAt === "number" ? src.lastSyncAt : null,
+    lastError: legacy ? null : typeof src.lastError === "string" ? src.lastError : null,
+    statusLog: legacy ? [] : Array.isArray(src.statusLog) ? src.statusLog : [],
+    localCursor: legacy ? 0 : typeof src.localCursor === "number" ? src.localCursor : 0,
+    pathTips: legacy ? {} : src.pathTips && typeof src.pathTips === "object" ? src.pathTips : {},
+    lastHlc: legacy ? null : typeof src.lastHlc === "string" ? src.lastHlc : null,
+  };
+  if (!out.relayUrl) delete out.relayUrl;
+  if (!out.ignorePatterns) delete out.ignorePatterns;
+  return { out, legacy, extra: Object.keys(src).some((k) => !FLOCK_KEYS.includes(k)) };
+}
+
+function patchPluginData(vaultPath, relayUrl) {
   const dataPath = path.join(vaultPath, ".obsidian", "plugins", PLUGIN_ID, "data.json");
-  let data = {};
+  let parsed = {};
   if (fs.existsSync(dataPath)) {
     try {
-      data = JSON.parse(fs.readFileSync(dataPath, "utf8"));
+      const raw = JSON.parse(fs.readFileSync(dataPath, "utf8"));
+      if (raw && typeof raw === "object") parsed = raw;
     } catch {
-      data = {};
+      parsed = {};
     }
   }
-  data.clientId = creds.clientId;
-  data.clientSecret = creds.clientSecret || data.clientSecret || "";
-  const listed = (creds.redirects || []).map(String);
-  if (listed.some((u) => u.includes("127.0.0.1"))) {
-    data.redirectUri = "http://127.0.0.1:42813/";
-  } else if (listed.some((u) => /localhost/i.test(u))) {
-    // Desktop client JSON often lists http://localhost — match host to avoid redirect_uri_mismatch
-    data.redirectUri = "http://localhost:42813/";
-  } else if (!data.redirectUri) {
-    data.redirectUri = "http://127.0.0.1:42813/";
-  }
-  fs.writeFileSync(dataPath, JSON.stringify(data, null, 2) + "\n", "utf8");
-  console.log(`Wrote OAuth Client ID into plugin data.json`);
-  console.log(`Redirect URI set to: ${data.redirectUri}`);
+  const { out, legacy, extra } = toFlockData(parsed, relayUrl);
+  if (!relayUrl && !legacy && !extra && fs.existsSync(dataPath)) return;
+  fs.mkdirSync(path.dirname(dataPath), { recursive: true });
+  fs.writeFileSync(dataPath, JSON.stringify(out, null, 2) + "\n", "utf8");
+  if (relayUrl) console.log(`Wrote relay URL into plugin data.json: ${relayUrl}`);
+  if (legacy || extra) console.log("Removed leftover Google Drive credentials from data.json");
 }
 
-function installToVault(vaultPath, creds) {
+function installToVault(vaultPath, relayUrl) {
   const target = path.join(vaultPath, ".obsidian", "plugins", PLUGIN_ID);
   fs.mkdirSync(target, { recursive: true });
 
@@ -153,7 +186,7 @@ function installToVault(vaultPath, creds) {
   }
   console.log(`Installed → ${target}`);
   enablePlugin(vaultPath);
-  if (creds) writePluginSettings(vaultPath, creds);
+  patchPluginData(vaultPath, relayUrl);
 }
 
 async function resolveVaultPath() {
@@ -190,50 +223,46 @@ async function main() {
   loadEnv();
   ensureBuilt();
 
-  const credArg = process.argv.find((a) => a.startsWith("--credentials="))?.slice("--credentials=".length);
-  const credPath = credArg || process.env.GOOGLE_OAUTH_CREDENTIALS;
-  let creds = null;
-  if (credPath) {
-    const resolved = path.resolve(credPath);
-    if (!fs.existsSync(resolved)) {
-      console.error(`Credentials file not found: ${resolved}`);
-      process.exit(1);
-    }
-    creds = parseCredentialsFile(resolved);
-    console.log(`Loaded Google OAuth client from: ${resolved}`);
-  }
-
   const vaultPath = await resolveVaultPath();
   if (!fs.existsSync(vaultPath)) {
     console.error(`Vault path does not exist: ${vaultPath}`);
     process.exit(1);
   }
 
+  // Optional: point the plugin at a specific relay (e.g. a deployed worker).
+  // Unset = plugin default (http://127.0.0.1:8787, the local dev relay).
+  const relayUrl = process.env.FLOCK_RELAY_URL?.trim() || null;
+  if (relayUrl) console.log(`Using relay URL from FLOCK_RELAY_URL: ${relayUrl}\n`);
+
   console.log(`\nInstalling into: ${vaultPath}\n`);
-  installToVault(vaultPath, creds);
+  installToVault(vaultPath, relayUrl);
 
   const envPath = path.join(root, ".env");
   if (!fs.existsSync(envPath)) {
-    let envBody = `OBSIDIAN_VAULT_PATH=${vaultPath}\n`;
-    if (credPath) envBody += `GOOGLE_OAUTH_CREDENTIALS=${path.resolve(credPath)}\n`;
-    fs.writeFileSync(envPath, envBody, "utf8");
-    console.log(`Saved paths to .env for next time`);
+    fs.writeFileSync(envPath, `OBSIDIAN_VAULT_PATH=${vaultPath}\n`, "utf8");
+    console.log(`Saved vault path to .env for next time`);
   }
 
   console.log(`
 Done. Restart Obsidian (or reload the vault).
 
-Still needed once inside Obsidian:
+Pair your devices (Flock Sync — no Google account):
   1. If Restricted mode is on → turn it off
-  2. Settings → Google Drive Sync → Connect Google
-  3. Set Remote folder name → Sync now
-${creds ? "  (Client ID / Secret were pre-filled from your credentials file)\n" : "  (Paste Client ID if not using --credentials=...)\n"}
-Important: In Google Cloud, for this Desktop client, loopback auth uses:
-  http://127.0.0.1:42813/
-If Connect fails with redirect_uri_mismatch, add that URI (or use http://localhost:42813/ in plugin settings to match your client JSON).
+  2. Make sure the relay is running (desktop): cd relay && npm run dev
+     (first time: npm install, then
+      npx wrangler d1 execute flock --local --file=src/schema.sql)
+  3. Settings → Flock Sync → "Pair a device" → Start pairing
+     → shows a nameplate, two words, and a QR code
+  4. On the other device: enter the code (e.g. 123-able-acid) or scan the QR
+  5. Compare the three check words on both screens → tap Pair on both
+  6. "Link this vault" on every device that should sync this vault
+  7. Sync now (ribbon, status bar, or command palette)
 
-Re-run:
-  npm run setup -- --credentials="C:\\\\path\\\\to\\\\client_secret.json"
+Notes:
+  - Pairing is once per device; linking is per vault.
+  - Phones cannot reach http://127.0.0.1:8787 (cleartext HTTP is blocked on
+    mobile). Deploy the relay later and build with FLOCK_RELAY_URL=<https-url>
+    to add mobile devices — not needed for desktop-to-desktop sync.
 `);
 }
 

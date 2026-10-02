@@ -31,21 +31,7 @@ loadEnvFile();
 
 const prod = process.argv[2] === "production";
 
-const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID || process.env.OBSIDIAN_GDRIVE_CLIENT_ID || "";
-const clientSecret =
-  process.env.GOOGLE_OAUTH_CLIENT_SECRET || process.env.OBSIDIAN_GDRIVE_CLIENT_SECRET || "";
-const redirectUri =
-  process.env.GOOGLE_OAUTH_REDIRECT_URI ||
-  process.env.OBSIDIAN_GDRIVE_REDIRECT_URI ||
-  "http://127.0.0.1:42813/";
-
-if (prod && clientId) {
-  console.log(`[esbuild] Bundling OAuth Client ID into main.js (${clientId.slice(0, 12)}…)`);
-} else if (prod) {
-  console.warn(
-    "[esbuild] No GOOGLE_OAUTH_CLIENT_ID in env/.env — Connect Google will require pasting Client ID."
-  );
-}
+const relayUrl = process.env.FLOCK_RELAY_URL || "http://127.0.0.1:8787";
 
 const context = await esbuild.context({
   banner: { js: banner },
@@ -74,9 +60,7 @@ const context = await esbuild.context({
   treeShaking: true,
   outfile: "main.js",
   define: {
-    __GDRIVE_CLIENT_ID__: JSON.stringify(clientId),
-    __GDRIVE_CLIENT_SECRET__: JSON.stringify(clientSecret),
-    __GDRIVE_REDIRECT_URI__: JSON.stringify(redirectUri),
+    __FLOCK_RELAY_URL__: JSON.stringify(relayUrl),
   },
 });
 

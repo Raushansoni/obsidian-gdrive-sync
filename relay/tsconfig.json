@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    // "DOM" libs provide the Workers web globals (Request/Response/crypto/URL/...):
+    // @cloudflare/workers-types is intentionally not installed (types: []) and
+    // the ambient binding declarations live in src/index.ts. wrangler bundles
+    // this code directly, so these are typecheck-only settings.
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": [],
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*.ts"]
+}

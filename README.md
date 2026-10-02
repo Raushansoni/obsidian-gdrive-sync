@@ -1,152 +1,218 @@
-# Google Drive Sync for Obsidian
+# Flock Sync for Obsidian
 
-Bidirectional vault sync across **Android, Windows, macOS, and Linux** using your Google Drive storage.
+End-to-end encrypted vault sync for Obsidian across **Windows, macOS, Linux, Android, and iOS** — no Google account, no cloud drive, no third-party file storage reading your notes.
 
-Same Google account + same remote folder name on every device = one shared vault.
+Pair your devices once, link a vault, and Flock Sync keeps it in sync through a small relay while Obsidian is open. The relay only ever sees **ciphertext**.
 
-## Features
+- Works in Obsidian Desktop **and** Obsidian Mobile (`isDesktopOnly: false`, minAppVersion 1.11.4)
+- Pairing with a 3-digit nameplate + two words — or scan a QR code
+- End-to-end encryption (AES-GCM); the relay stores only encrypted blobs
+- Conflicts become **sibling files**, never a silent last-write-wins overwrite
+- Recovery via **32 wordlist words** from your flock secret
 
-- Works in Obsidian Desktop and Obsidian Mobile (`isDesktopOnly: false`)
-- OAuth connect (auto loopback on desktop; paste-code flow on mobile)
-- Automatic sync (local watchers + interval pull)
-- Manual **Sync now** command / ribbon / status bar
-- Last-write-wins with conflict copies: `Note (conflict YYYY-MM-DD).md`
-- Ignores noisy paths (workspace cache, trash, plugin data) by default
-- Syncs notes, attachments, and selected `.obsidian` config files
+## How it works
 
-## Cross-device setup (Android ↔ Windows ↔ Mac)
+1. **Pair** — two devices exchange a short pairing code (`123-able-acid`) over the relay and verify a three-word fingerprint on both screens. Pairing happens **once per device**; the flock identity is stored in Obsidian's SecretStorage (and localStorage as fallback), not in the vault.
+2. **Link this vault** — each device chooses which of its vaults joins the flock. You can link several vaults.
+3. **Sync** — while Obsidian is open, changes are pushed and pulled through the relay, end-to-end encrypted.
 
-1. Install this plugin on **every** device (same build).
-2. Use the **same Google account** on every device.
-3. Use the **exact same Remote folder name** (e.g. `Personal`).
-4. Connect Google → Sync now.
+## 1. Run the relay (desktop, local)
 
-Files live under Google Drive:
+The plugin ships with the default relay URL `http://127.0.0.1:8787`, which is what `wrangler dev` serves. From the repo root:
 
-`My Drive / ObsidianVaults / <Remote folder name> / …`
+```bash
+cd relay
+npm install
+npx wrangler d1 execute flock --local --file=src/schema.sql
+npm run dev
+```
 
-## 1. Google Cloud (once)
+Keep that terminal running while you sync. This local relay is all you need for **desktop-to-desktop** sync.
 
-1. Open [Google Cloud Console](https://console.cloud.google.com/).
-2. Create a project (or pick one).
-3. Enable **Google Drive API**.
-4. **OAuth consent screen**
-   - User type: **External**
-   - Publishing status: **Testing**
-   - Add your Google account(s) under **Test users** (every account that will sync).
-5. **Credentials → Create credentials → OAuth client ID**
-   - Application type: **Desktop app** (recommended for this plugin)
-   - Copy the **Client ID** (and **Client Secret** if shown)
-6. Plugin redirect URI (loopback — does **not** use any website / Vercel / Navigator app):
+> **Mobile note:** Obsidian on Android/iOS blocks cleartext HTTP, so phones cannot reach `http://127.0.0.1:8787`. Deploying the relay (later, optional) and building the plugin with `FLOCK_RELAY_URL=https://your-worker.example` is how mobile joins the flock. You do **not** need to deploy anything to try desktop sync today — deployment is not required for this milestone.
 
-   `http://127.0.0.1:42813/`
+To bake a different relay URL into `main.js` at build time:
 
-   - **Desktop** clients: loopback is handled automatically.
-   - **Web** clients: add that exact URI under Authorized redirect URIs, and paste the Client Secret in plugin settings.
-   - Do not point this plugin at an unrelated web app’s redirect URL.
+```bash
+# bash / macOS / Linux
+FLOCK_RELAY_URL=https://your-relay.example npm run build
 
-## 2. Install
+# PowerShell
+$env:FLOCK_RELAY_URL="https://your-relay.example"; npm run build
+```
 
-### Phone / any device — BRAT (recommended)
+(You can also change **Relay URL** in the plugin settings at runtime.)
 
-1. In Obsidian: **Settings → Community plugins → Browse** → install **BRAT** (by TfTHacker) → Enable it  
-2. Turn **Restricted mode OFF** if prompted  
-3. Command palette → **BRAT: Add beta plugin**  
-4. Paste this repo URL:
+## 2. Install the plugin
+
+### Option A — BRAT (phone + desktop)
+
+1. In Obsidian: **Settings → Community plugins** — turn Restricted mode off, then install **BRAT** (by TfTHacker) and enable it.
+2. Command palette → **BRAT: Add a beta plugin for testing**.
+3. Paste:
 
    `https://github.com/Raushansoni/obsidian-gdrive-sync`
 
-5. Enable **Google Drive Sync** in Community plugins  
-6. Plugin settings → **Connect Google** (Client ID is pre-filled in official releases) → same **Remote folder name** as your PC → **Sync now**
+4. Enable **Flock Sync** in Community plugins.
+5. After updates: **BRAT: Check for plugin updates**.
 
-BRAT installs from GitHub **Releases** (`main.js`, `manifest.json`, `styles.css`). After updates: **BRAT: Check for plugin updates**.
+BRAT installs from GitHub **Releases** (`main.js`, `manifest.json`, `styles.css`). Use the latest **v2** release (Flock Sync). Older **v1.x** releases are the previous Google Drive plugin.
 
-Official release builds bake in the OAuth client at compile time (via CI secrets / local `.env`). The GitHub **source** does not contain those values.
+Set **Relay URL** in plugin settings. Desktop local relay is `http://127.0.0.1:8787`. A phone needs an `https://` relay — localhost will not work on mobile.
 
-### Desktop — local setup script
+### Option B — setup script (this machine)
+
+From the repo root:
 
 ```bash
 npm install
+npm run build
 npm run setup
 ```
 
-Options:
+The script builds the plugin, finds your Obsidian vaults automatically (or you pass one), copies the plugin files in, and enables the plugin:
 
 ```bash
 npm run setup -- --vault="C:\Users\YOU\Documents\MyVault"
-npm run setup -- --credentials="C:\path\to\client_secret.json"
-npm run setup -- --rebuild
+npm run setup -- --rebuild   # force a rebuild first
 ```
 
-Then: Connect Google → Remote folder name → Sync now.
+### Option C — manual copy
 
-## Mobile auth (device code)
+```bash
+npm install && npm run build
+```
 
-Phones cannot use the desktop loopback redirect (`http://127.0.0.1:42813/`). Mobile uses Google’s **device-code** login instead — no redirect URI and no hosted callback page.
+Then copy these three files:
 
-### Google Cloud — “TVs and Limited Input devices” client
+```
+main.js
+manifest.json
+styles.css
+```
 
-1. [Credentials](https://console.cloud.google.com/apis/credentials) → **Create OAuth client ID**  
-2. Application type: **TVs and Limited Input devices**  
-3. Name it (e.g. `Obsidian GDrive Sync`) → **Create**  
-4. Copy **Client ID** + **Client Secret** (no redirect URIs)  
-5. Put them in GitHub secrets / `.env` and cut a release (or paste into plugin settings)  
-6. OAuth consent screen: **External** + **In production** so any Google account can approve
+into your vault at:
 
-Keep a **Desktop** client for PC browser loopback if you want; mobile (and desktop fallback) uses the TV/device client.
+```
+<vault>/.obsidian/plugins/obsidian-gdrive-sync/
+```
 
-### Connect on Android / iOS
+The folder name must be exactly `obsidian-gdrive-sync` (the plugin id). Restart Obsidian, go to **Settings → Community plugins**, turn Restricted mode off if prompted, and enable **Flock Sync**.
 
-1. Update plugin to **1.0.4+** via BRAT  
-2. Tap **Connect Google**  
-3. Open **google.com/device** (button in settings)  
-4. Enter the on-screen code → Allow  
-5. Obsidian connects automatically → set remote folder → **Sync now**
+## 3. Pair your devices
+
+Do this once per device. You need two devices with the plugin installed and the relay reachable.
+
+**On the first device (the host):**
+
+1. Open **Settings → Flock Sync**.
+2. Under **Pair a device**, tap **Start pairing**.
+3. The plugin shows a **nameplate** (3 digits), **two words**, the full code (e.g. `123-able-acid`), and a **QR code**.
+
+**On the second device (the guest):**
+
+1. Open **Settings → Flock Sync**.
+2. Under **I have a code**, enter the code shown on the host (e.g. `123-able-acid`) and tap **Join** — or scan the host's QR code with your phone camera; it opens the deep link `obsidian://flock-sync?n=<nameplate>&c=<code>` and lands you in the pairing flow.
+3. Both screens now show **three check words** (the fingerprint). Compare them.
+4. If they match on both devices, tap **Pair** on both.
+
+**Then, on every device that should sync a given vault:**
+
+- Tap **Link this vault** in Settings → Flock Sync.
+
+Pairing is stored once per device (flock identity in SecretStorage + localStorage) — you never pair the same device twice, even across multiple vaults.
+
+To add a third device later, open Settings → Flock Sync on an already-paired device and tap **Add another device**. That shows the same nameplate / QR flow and reuses the existing flock secret (nothing is re-keyed). The new device joins as a guest with the code.
+
+## 4. Sync
+
+- **Sync now** — ribbon icon, command palette, the status bar (click it), or the **Actions → Sync now** button in settings.
+- **Auto sync** — on by default; pushes/pulls every *Sync interval* seconds (default 20, minimum 15) while Obsidian is open, and again when the app window regains focus or a file changes.
+- Mobile syncs while the Obsidian app is open; it is not a background push service.
+
+### Status bar meanings
+
+The status bar item starts with `Flock:` and clicking it runs a sync.
+
+| Status | Meaning |
+|--------|---------|
+| `Flock: Pair in settings` | This device has no flock yet — start pairing in settings |
+| `Flock: Link this vault` | Device is paired, but this vault is not linked yet |
+| `Flock: Syncing` | A sync round is running (may show a queue count) |
+| `Flock: Waiting (open app to sync)` | Paired and linked; syncs resume when Obsidian is open |
+| `Flock: Retrying…` | The last round hit a transient problem and will retry |
+| `Flock: Paused` | Auto sync is paused/off |
+| `Flock: Ready` | Linked, idle, nothing pending yet |
+| `Flock: 10:24:31` | Time of the last completed sync |
+| `Flock: Conflict …` | Conflicting edits were kept as sibling files (see below) |
+| `Flock: Error` | Sync failed — hover for the detail, check settings for the last error |
+
+### Conflicts
+
+If the same file changed on two devices between syncs, Flock Sync does **not** silently pick a winner. Both versions survive as siblings:
+
+```
+Note.md
+Note (conflict 2026-10-02).md
+```
+
+Merge by hand, then delete the copy you don't want. Conflict files are synced too, so every device sees both versions.
+
+### Ignore patterns
+
+Settings → Flock Sync → **Ignore patterns** (one vault path per line, `#` starts a comment). Matching is exact path, folder prefix, or a simple `*.ext` glob. Defaults:
+
+```
+.obsidian/workspace
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+.obsidian/workspaces.json
+.obsidian/cache
+.obsidian/plugins/obsidian-gdrive-sync/data.json
+.trash
+.git
+.DS_Store
+desktop.ini
+Thumbs.db
+```
+
+Matched files are never synced. The plugin's own `data.json` is always ignored (it holds relay URLs and cursors, not secrets).
+
+## Recovery words
+
+After pairing, Settings → Flock Sync shows **Recovery words**: 32 words derived from your flock secret. This is the only place they are ever shown.
+
+Write them down and keep them somewhere safe. They restore your flock secret on a new device — without them, a lost device is just a device you revoke from the flock, but a lost *flock secret* means the encrypted data on the relay is unreadable.
 
 ## Commands
 
 | Command | Action |
-|--------|--------|
-| Sync now | Run a full bidirectional sync |
-| Connect Google account | Start OAuth |
-| Disconnect Google account | Revoke local tokens |
-| Open Google Drive Sync settings | Jump to settings |
-
-## Conflict handling
-
-If the same note changed on two devices since the last sync:
-
-- Local version is kept as the main file
-- Remote version is saved as `Note (conflict YYYY-MM-DD).md`
-- Local version is pushed to Drive
+|---------|--------|
+| **Sync now** | Run a full bidirectional sync |
+| **Link this vault to flock** | Enroll the current vault (pair first) |
+| **Open Flock Sync settings** | Jump to the settings tab |
 
 ## Security notes
 
-- Vault files are stored in **your** Google Drive (not end-to-end encrypted by this plugin).
-- OAuth tokens are stored in the plugin `data.json` inside the vault’s `.obsidian` folder (that file is ignored from sync by default).
-- Scope used: `drive.file` (only files created/opened by this app).
+- Notes and attachments are encrypted client-side (AES-GCM) before they touch the relay; the relay stores only ciphertext and metadata (paths are encrypted too).
+- Pairing is interactive and verified by comparing the three-word fingerprint on both screens.
+- Flock identity (device keys + flock secret) lives in Obsidian's SecretStorage (keychain / credential vault) with a localStorage fallback. It is never written into the vault or synced.
+- Back up your **32 recovery words**; they are the only way to restore the flock secret.
+- Revoking a device in Settings → Flock Sync immediately cuts it off from the relay.
+
+## Not in v1
+
+- **No Google Drive importer** — this plugin no longer talks to Google Drive at all. Bring your notes into the vault with any file copy; there is no migration from a previous Google-Drive-based build.
+- **No background mobile push** — on Android/iOS, sync runs while the Obsidian app is open, not in the background.
+- **No public hosted relay** — the default relay URL is the local dev relay (`http://127.0.0.1:8787`). Deploying your own Cloudflare Worker is optional and not required for desktop-local sync.
+- Not a real-time collaborative editor (device sync, not CRDT).
 
 ## Development
 
 ```bash
-npm run dev          # watch build
-npm run build        # production build
-npm run setup        # build (if needed) + install + enable in vault
+npm run dev        # watch build
+npm run build      # typecheck + production build
+npm run setup      # build (if needed) + install + enable in a vault
 ```
 
-### Publish a BRAT release
-
-```bash
-npm run build
-git add -A && git commit -m "release: v1.0.1"
-git tag v1.0.1
-git push origin main --tags
-```
-
-Or run the **Build and release** GitHub Action (workflow_dispatch). Bump `version` in `manifest.json` / `package.json` to match the tag.
-
-## Limitations (v1)
-
-- First sync of a large vault can take a while (full listing + uploads).
-- Not a real-time collaborative editor (device sync, not CRDT).
-- Requires Google Cloud OAuth client in Testing mode for personal use (no Play Store / Community listing verification needed).
+The relay lives in `relay/` (Cloudflare Worker: pairing mailbox, per-vault Durable Object log, R2 blobs, D1 device registry). See `relay/README.md` and `protocol/HTTP.md`.
