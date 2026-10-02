@@ -42,7 +42,7 @@ export default class FlockSyncPlugin extends Plugin {
     this.statusBarEl.addClass("flock-sync-status");
     this.statusBarEl.onclick = () => void this.syncNow();
     this.status.onChange = () => this.paintStatus();
-    this.status.hydrate(this.data);
+    this.status.hydrate(() => this.data);
     this.paintStatus();
 
     this.addRibbonIcon(RIBBON_ICON_ID, "Flock Sync now", () => void this.syncNow());

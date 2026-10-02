@@ -114,6 +114,7 @@ export interface VaultEnrollRequest {
 export interface VaultListItem {
   vaultId: string;
   sealedMetaB64: string;
+  createdAt?: number;
 }
 
 export interface SignedOp {

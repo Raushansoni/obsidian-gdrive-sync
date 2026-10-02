@@ -2,7 +2,7 @@ import { App, TAbstractFile, TFile, TFolder, normalizePath } from "obsidian";
 import type { PathTip, PluginData } from "../plugin-data";
 import type { SignedOp } from "../protocol";
 import { MAX_BLOB_BYTES } from "../protocol";
-import { seal, sealDeterministic, sealJson, open } from "../crypto/box";
+import { seal, sealDeterministic, sealJson, open, openJson } from "../crypto/box";
 import { b64ToBytes, bytesToB64, fromUtf8, utf8 } from "../crypto/bytes";
 import { hkdf } from "../crypto/hkdf";
 import {
@@ -21,9 +21,11 @@ import { dirname, normalizeVaultPath } from "../util/paths";
 import { isIgnored, parseIgnorePatterns } from "./ignore";
 import { uniqueConflictPath } from "./conflict";
 import { isConfigPathAllowed, listConfigRelPaths } from "./config-dir";
+import { namesMatch, pickRichestVault, pickVaultToLink, shouldEnqueueLocalPath } from "./pick-vault";
 import type { IdentityStore } from "../identity";
 import type { RelayHttp } from "../relay/client";
 import type { StatusMachine } from "../status/machine";
+import type { VaultListItem } from "../protocol";
 
 const WATCH_DEBOUNCE_MS = 1200;
 const PULL_PAGE_LIMIT = 200; // relay returns at most this many ops per pull
@@ -181,22 +183,111 @@ export class FlockSyncEngine {
     if (!this.identity.hasFlock() || !secret) {
       throw new Error("Pair a device first");
     }
-    const alreadyEnrolled = data.enrolled && !!data.vaultId;
-    if (!data.vaultId) data.vaultId = crypto.randomUUID();
-    if (!alreadyEnrolled) {
-      const sealedMetaB64 = await sealJson(secret, {
-        name: this.app.vault.getName(),
-        createdAt: Date.now(),
-      });
-      await this.relay.vaultEnroll({ vaultId: data.vaultId, sealedMetaB64 });
-      data.enrolled = true;
-      this.status.note(`Vault linked — ${this.app.vault.getName()}`);
-      this.status.set("waiting", "Vault linked — syncing…");
-      await this.io.saveData();
+    const vaultId = await this.resolveSharedVaultId();
+    const switched = data.enrolled && !!data.vaultId && data.vaultId !== vaultId;
+    if (switched) {
+      await this.adoptVault(
+        vaultId,
+        `Joined the shared "${this.app.vault.getName()}" vault so notes can move between devices`
+      );
       this.scheduleSync(300);
-    } else {
-      await this.io.saveData();
+      return;
     }
+    data.vaultId = vaultId;
+    const sealedMetaB64 = await sealJson(secret, {
+      name: this.app.vault.getName(),
+      createdAt: Date.now(),
+    });
+    await this.relay.vaultEnroll({ vaultId, sealedMetaB64 });
+    data.enrolled = true;
+    this.status.note(`Vault linked — ${this.app.vault.getName()}`);
+    this.status.set("waiting", "Vault linked — syncing…");
+    await this.io.saveData();
+    this.scheduleSync(300);
+  }
+
+  /**
+   * If this flock already has a vault with our name (or only one vault),
+   * join that log instead of minting a second UUID.
+   */
+  private async resolveSharedVaultId(): Promise<string> {
+    const data = this.io.getData();
+    const secret = this.identity.flockSecret;
+    const localName = this.app.vault.getName();
+    if (!secret) return data.vaultId || crypto.randomUUID();
+
+    let list: VaultListItem[] = [];
+    try {
+      list = await this.relay.vaultList();
+    } catch {
+      list = [];
+    }
+    const named = [];
+    for (const item of list) {
+      named.push({
+        vaultId: item.vaultId,
+        name: await decodeVaultName(secret, item.sealedMetaB64),
+        createdAt: item.createdAt,
+      });
+    }
+    const sameName = named.filter((v) => namesMatch(v.name, localName));
+    if (sameName.length > 1) {
+      const heads: Array<{ vaultId: string; head: number }> = [];
+      for (const v of sameName) {
+        try {
+          const m = await this.relay.merkle(v.vaultId);
+          heads.push({ vaultId: v.vaultId, head: typeof m.head === "number" ? m.head : 0 });
+        } catch {
+          heads.push({ vaultId: v.vaultId, head: 0 });
+        }
+      }
+      if (heads.some((h) => h.head > 0)) {
+        return pickRichestVault(heads) ?? sameName[0].vaultId;
+      }
+      if (data.vaultId && sameName.some((v) => v.vaultId === data.vaultId)) return data.vaultId;
+    }
+    return pickVaultToLink(named, localName, data.vaultId) ?? data.vaultId ?? crypto.randomUUID();
+  }
+
+  /** Move this device onto an existing flock vault and replay its log from seq 0. */
+  async adoptVault(vaultId: string, reason: string): Promise<void> {
+    const data = this.io.getData();
+    const secret = this.identity.flockSecret;
+    if (!secret) throw new Error("Pair a device first");
+    const sealedMetaB64 = await sealJson(secret, {
+      name: this.app.vault.getName(),
+      createdAt: Date.now(),
+    });
+    await this.relay.vaultEnroll({ vaultId, sealedMetaB64 });
+    data.vaultId = vaultId;
+    data.enrolled = true;
+    data.localCursor = 0;
+    data.pathTips = {};
+    data.lastHlc = null;
+    this.configStatCache.clear();
+    this.status.note(reason);
+    await this.io.saveData();
+  }
+
+  async listNamedVaults(): Promise<Array<{ vaultId: string; name: string | null; current: boolean }>> {
+    const secret = this.identity.flockSecret;
+    const current = this.io.getData().vaultId;
+    if (!secret) return [];
+    let list: VaultListItem[] = [];
+    try {
+      list = await this.relay.vaultList();
+    } catch {
+      return [];
+    }
+    const out: Array<{ vaultId: string; name: string | null; current: boolean }> = [];
+    for (const item of list) {
+      out.push({
+        vaultId: item.vaultId,
+        name: await decodeVaultName(secret, item.sealedMetaB64),
+        current: item.vaultId === current,
+      });
+    }
+    return out;
   }
 
   // ------------------------------------------------------------------ sync
@@ -239,6 +330,18 @@ export class FlockSyncEngine {
     let conflictCount = 0;
 
     try {
+      const sharedId = await this.resolveSharedVaultId();
+      if (data.vaultId && sharedId !== data.vaultId) {
+        await this.adoptVault(
+          sharedId,
+          `Joined the shared "${this.app.vault.getName()}" vault so notes can move between devices`
+        );
+      }
+      const ctx = this.opCtx();
+      if (!ctx) {
+        this.status.set("error", "Missing device identity");
+        return;
+      }
       const { vaultId, secret, deviceId } = ctx;
 
       // ---------------- Pull remote ops (seq > localCursor), apply in order
@@ -362,7 +465,7 @@ export class FlockSyncEngine {
       await this.scanConfigChanges(data);
 
       // ---------------- Universe scan: file keys = getFiles() + config paths
-      this.scanAllLocalFiles(data); // full scan only while pathTips is empty
+      this.scanNewLocalFiles(data); // files never synced (including after joining a shared vault)
       this.scanMissingFiles(data); // cheap existence check → tombstones
 
       // ---------------- Push local changes
@@ -718,14 +821,13 @@ export class FlockSyncEngine {
     }
   }
 
-  /** Initial upload: only when no tips exist yet (never full-rescan later). */
-  private scanAllLocalFiles(data: PluginData): void {
-    if (Object.keys(data.pathTips).length > 0) return;
+  /** Files with no tip (or a tombstone) — first upload and join-existing-vault. */
+  private scanNewLocalFiles(data: PluginData): void {
     for (const f of this.app.vault.getFiles()) {
       const p = normalizeVaultPath(f.path);
       if (this.isConfigPath(p)) continue;
       if (this.shouldIgnore(p)) continue;
-      this.pendingLocal.add(p);
+      if (shouldEnqueueLocalPath(data.pathTips[p])) this.pendingLocal.add(p);
     }
   }
 
@@ -816,4 +918,13 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+async function decodeVaultName(secret: Uint8Array, sealedMetaB64: string): Promise<string | null> {
+  try {
+    const meta = await openJson<{ name?: unknown }>(secret, sealedMetaB64);
+    return typeof meta.name === "string" && meta.name.trim() ? meta.name : null;
+  } catch {
+    return null;
+  }
 }

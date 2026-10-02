@@ -170,5 +170,6 @@ export async function listVaults(env: Env, flockId: string): Promise<VaultListIt
   return (result.results ?? []).map((row) => ({
     vaultId: row.vault_id,
     sealedMetaB64: row.sealed_meta,
+    createdAt: row.created_at,
   }));
 }

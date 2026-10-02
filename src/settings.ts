@@ -400,6 +400,7 @@ export class FlockSettingTab extends PluginSettingTab {
             await plugin.linkVault();
           })
         );
+      this.renderFlockVaults(wrap);
       this.renderAddAnotherDevice(wrap);
       this.renderRecoveryWords(wrap);
       return;
@@ -423,10 +424,73 @@ export class FlockSettingTab extends PluginSettingTab {
     if (plugin.data.vaultId) {
       wrap.createEl("p", { text: `Vault ID: ${plugin.data.vaultId}` });
     }
+    const log = plugin.status.snapshotLog();
+    if (log.length) {
+      const recent = wrap.createDiv({ cls: "flock-status-log" });
+      recent.createEl("h4", { text: "Recent sync" });
+      recent.createEl("pre", {
+        text: log
+          .slice(-8)
+          .map((e) => e.msg)
+          .join("\n"),
+      });
+    }
 
+    this.renderFlockVaults(wrap);
     this.renderAddAnotherDevice(wrap);
     this.renderDevices(wrap);
     this.renderRecoveryWords(wrap);
+  }
+
+  /** Flock vaults on the relay — join the shared one so devices exchange notes. */
+  private renderFlockVaults(wrap: HTMLElement): void {
+    const sec = wrap.createDiv({ cls: "flock-vaults" });
+    sec.createEl("h4", { text: "Shared vault" });
+    const listEl = sec.createDiv();
+    listEl.setText("Loading…");
+    void (async () => {
+      try {
+        const vaults = (await this.plugin.engine?.listNamedVaults()) ?? [];
+        if (!this.containerEl?.isConnected) return;
+        listEl.empty();
+        if (!vaults.length) {
+          listEl.setText("No vaults on the relay yet. Tap Link this vault.");
+          return;
+        }
+        const names = vaults.map((v) => (v.name ?? "").trim().toLowerCase()).filter(Boolean);
+        if (names.length !== new Set(names).size) {
+          listEl.createEl("p", {
+            cls: "mod-warning",
+            text: "Phone and PC linked as two separate vaults with the same name, so files never crossed. Tap Join shared vault (or Sync now) to use the copy that already has notes.",
+          });
+        }
+        for (const v of vaults) {
+          const row = new Setting(listEl);
+          row.setName(v.name || v.vaultId.slice(0, 8));
+          row.setDesc(v.current ? `this device · ${v.vaultId}` : v.vaultId);
+        }
+        new Setting(listEl)
+          .setName("Use shared vault")
+          .setDesc("Both devices must enroll in the same vault id. This joins the existing one with this name.")
+          .addButton((btn) =>
+            btn.setButtonText("Join shared vault").setCta().onClick(async () => {
+              btn.setDisabled(true);
+              try {
+                await this.plugin.linkVault();
+                await this.plugin.syncNow(true);
+              } catch (e) {
+                new Notice(`Join failed: ${errMsg(e)}`, 8000);
+              }
+              if (this.containerEl?.isConnected) this.display();
+            })
+          );
+      } catch (e) {
+        if (!this.containerEl?.isConnected) return;
+        listEl.empty();
+        const warn = listEl.createEl("span", { cls: "mod-warning" });
+        warn.setText(`Could not load vaults: ${errMsg(e)}`);
+      }
+    })();
   }
 
   /**

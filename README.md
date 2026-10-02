@@ -121,7 +121,7 @@ Do this once per device. You need two devices with the plugin installed and the 
 
 **Then, on every device that should sync a given vault:**
 
-- Tap **Link this vault** in Settings → Flock Sync.
+- Tap **Link this vault** in Settings → Flock Sync. If the flock already has a vault with this name, the device **joins that vault** instead of creating a second copy. Two devices that each minted their own vault id will look "synced" but never exchange notes — tap **Join shared vault** or **Sync now** after updating to collapse them.
 
 Pairing is stored once per device (flock identity in SecretStorage + localStorage) — you never pair the same device twice, even across multiple vaults.
 

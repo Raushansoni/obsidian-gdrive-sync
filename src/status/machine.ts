@@ -24,20 +24,29 @@ export class StatusMachine {
   lastSyncAt: number | null = null;
   onChange: (() => void) | null = null;
 
-  /** Live plugin data captured by hydrate(); note() writes into its statusLog. */
-  private data: PluginData | null = null;
+  /** Live plugin data. Must be a getter — savePluginData() replaces plugin.data. */
+  private getData: (() => PluginData | null) | null = null;
   /** In-memory mirror of statusLog so snapshotLog() works before/without data. */
   private log: StatusLogEntry[] = [];
 
   /** Restore lastSyncAt and the statusLog tail from persisted plugin data. */
-  hydrate(data: PluginData): void {
-    this.data = data;
-    this.lastSyncAt = typeof data.lastSyncAt === "number" ? data.lastSyncAt : null;
-    const persisted = Array.isArray(data.statusLog) ? data.statusLog : [];
+  hydrate(dataOrGet: PluginData | (() => PluginData)): void {
+    this.getData = typeof dataOrGet === "function" ? dataOrGet : () => dataOrGet;
+    const data = this.liveData();
+    this.lastSyncAt = data && typeof data.lastSyncAt === "number" ? data.lastSyncAt : null;
+    const persisted = data && Array.isArray(data.statusLog) ? data.statusLog : [];
     this.log = persisted.slice(-STATUS_LOG_MAX).map((e) => ({ t: e.t, msg: e.msg }));
     const tail = this.log.length > 0 ? this.log[this.log.length - 1].msg : "";
     if (tail) this.detail = tail;
     this.onChange?.();
+  }
+
+  private liveData(): PluginData | null {
+    try {
+      return this.getData?.() ?? null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -51,7 +60,8 @@ export class StatusMachine {
     if (queue !== undefined) this.queue = queue;
     if (state === "synced") {
       this.lastSyncAt = Date.now();
-      if (this.data) this.data.lastSyncAt = this.lastSyncAt;
+      const data = this.liveData();
+      if (data) data.lastSyncAt = this.lastSyncAt;
     }
     this.onChange?.();
   }
@@ -63,11 +73,12 @@ export class StatusMachine {
     if (this.log.length > STATUS_LOG_MAX) {
       this.log.splice(0, this.log.length - STATUS_LOG_MAX);
     }
-    if (this.data) {
-      if (!Array.isArray(this.data.statusLog)) this.data.statusLog = [];
-      this.data.statusLog.push(entry);
-      if (this.data.statusLog.length > STATUS_LOG_MAX) {
-        this.data.statusLog.splice(0, this.data.statusLog.length - STATUS_LOG_MAX);
+    const data = this.liveData();
+    if (data) {
+      if (!Array.isArray(data.statusLog)) data.statusLog = [];
+      data.statusLog.push(entry);
+      if (data.statusLog.length > STATUS_LOG_MAX) {
+        data.statusLog.splice(0, data.statusLog.length - STATUS_LOG_MAX);
       }
     }
   }
