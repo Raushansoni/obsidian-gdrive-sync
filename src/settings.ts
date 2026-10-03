@@ -115,9 +115,7 @@ export class FlockSettingTab extends PluginSettingTab {
   // ------------------------------------------------------------------ relay
 
   private renderRelaySetting(containerEl: HTMLElement): void {
-    const desc = Platform.isMobile
-      ? "Must be an https:// Cloudflare Worker. http://127.0.0.1 is your phone, not your PC — pairing will fail."
-      : "Desktop local relay is http://127.0.0.1:8787. Phones need the same https:// Worker URL.";
+    const desc = "Permanent relay. Phone and PC both use this address — leave it as-is.";
     new Setting(containerEl)
       .setName("Relay URL")
       .setDesc(desc)

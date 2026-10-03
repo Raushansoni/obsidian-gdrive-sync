@@ -28,7 +28,7 @@ import {
   shouldEnqueueLocalPath,
 } from "./pick-vault";
 import type { IdentityStore } from "../identity";
-import type { RelayHttp } from "../relay/client";
+import { RelayError, type RelayHttp } from "../relay/client";
 import type { StatusMachine } from "../status/machine";
 import type { VaultListItem } from "../protocol";
 
@@ -384,7 +384,7 @@ export class FlockSyncEngine {
       const { vaultId, secret, deviceId } = ctx;
 
       // ---------------- Pull remote ops (seq > localCursor), apply in order
-      const pull = await this.relay.opsPull(vaultId, data.localCursor);
+      const pull = await this.pullOps(vaultId, data);
       for (const op of pull.ops) {
         if (typeof op.seq === "number" && op.seq > data.localCursor) {
           data.localCursor = op.seq;
@@ -653,6 +653,47 @@ export class FlockSyncEngine {
 
   private shouldIgnore(path: string): boolean {
     return isIgnored(path, this.ignorePatterns);
+  }
+
+  /**
+   * The permanent Worker starts empty. A vault id from the old tunnel 404s.
+   * Enroll that same id, then upload local notes from scratch.
+   */
+  private async pullOps(vaultId: string, data: PluginData) {
+    try {
+      return await this.relay.opsPull(vaultId, data.localCursor);
+    } catch (e) {
+      if (!this.isMissingVault(e)) throw e;
+      await this.enrollCurrentVault(vaultId);
+      data.localCursor = 0;
+      data.pathTips = {};
+      data.lastHlc = null;
+      this.status.note("Linked this vault on the relay — uploading local notes");
+      return await this.relay.opsPull(vaultId, 0);
+    }
+  }
+
+  private isMissingVault(e: unknown): boolean {
+    return e instanceof RelayError && e.status === 404 && /vault not found/i.test(e.message);
+  }
+
+  private async enrollCurrentVault(vaultId: string): Promise<void> {
+    const secret = this.identity.flockSecret;
+    if (!secret) throw new Error("Pair a device first");
+    const sealedMetaB64 = await sealJson(secret, {
+      name: this.app.vault.getName(),
+      createdAt: Date.now(),
+    });
+    try {
+      await this.relay.vaultEnroll({ vaultId, sealedMetaB64 });
+    } catch (e) {
+      if (e instanceof RelayError && (e.status === 401 || e.code === "unauthorized")) {
+        throw new Error(
+          "This relay is new. On the PC tap Add device, then Scan QR on the phone."
+        );
+      }
+      throw e;
+    }
   }
 
   private opCtx(): OpCtx | null {

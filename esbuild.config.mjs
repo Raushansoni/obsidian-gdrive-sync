@@ -31,7 +31,8 @@ loadEnvFile();
 
 const prod = process.argv[2] === "production";
 
-const relayUrl = process.env.FLOCK_RELAY_URL || "http://127.0.0.1:8787";
+const relayUrl =
+  process.env.FLOCK_RELAY_URL || "https://flock-relay.raushansoni54321.workers.dev";
 
 const context = await esbuild.context({
   banner: { js: banner },

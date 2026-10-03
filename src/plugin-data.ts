@@ -1,4 +1,4 @@
-import { DEFAULT_RELAY_URL } from "./flock-url";
+import { DEFAULT_RELAY_URL, isEphemeralRelayUrl } from "./flock-url";
 
 export interface StatusLogEntry {
   t: number;
@@ -69,13 +69,19 @@ function looksLikeLegacyDrive(raw: Record<string, unknown>): boolean {
   );
 }
 
+function canonicalRelayUrl(raw: string): string {
+  const url = raw.trim();
+  if (!url || isEphemeralRelayUrl(url)) return DEFAULT_DATA.relayUrl;
+  return url;
+}
+
 /** Drop Drive-era fields so they never persist again after a Flock save. */
 export function sanitizePluginData(raw: unknown): PluginData {
   const r = isRecord(raw) ? raw : {};
   const legacy = looksLikeLegacyDrive(r);
   const interval = Number(r.syncIntervalSeconds);
   return {
-    relayUrl: typeof r.relayUrl === "string" && r.relayUrl.trim() ? r.relayUrl.trim() : DEFAULT_DATA.relayUrl,
+    relayUrl: canonicalRelayUrl(typeof r.relayUrl === "string" ? r.relayUrl : ""),
     vaultId: legacy ? null : typeof r.vaultId === "string" ? r.vaultId : null,
     enrolled: legacy ? false : r.enrolled === true,
     autoSync: r.autoSync !== false,

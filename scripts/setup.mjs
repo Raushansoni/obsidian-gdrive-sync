@@ -230,7 +230,7 @@ async function main() {
   }
 
   // Optional: point the plugin at a specific relay (e.g. a deployed worker).
-  // Unset = plugin default (http://127.0.0.1:8787, the local dev relay).
+  // Unset = plugin default (the permanent workers.dev relay).
   const relayUrl = process.env.FLOCK_RELAY_URL?.trim() || null;
   if (relayUrl) console.log(`Using relay URL from FLOCK_RELAY_URL: ${relayUrl}\n`);
 
