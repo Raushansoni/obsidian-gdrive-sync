@@ -55,6 +55,53 @@ export function qrPayload(nameplate: string, code: string): string {
   return `obsidian://flock-sync?n=${encodeURIComponent(nameplate)}&c=${encodeURIComponent(code)}`;
 }
 
+/**
+ * Turn scanned QR text into a pairing code (`737-baby-face`).
+ * Accepts the deep link, a query string, or the code typed by hand.
+ */
+export function codeFromScanText(raw: string): string {
+  const text = (raw ?? "").trim();
+  if (!text) throw new Error("Empty QR");
+
+  const q = text.indexOf("?");
+  const qs = q >= 0 ? text.slice(q + 1) : text.includes("=") ? text : "";
+  if (qs) {
+    const fromQuery = codeFromQuery(qs);
+    if (fromQuery) return fromQuery;
+  }
+
+  const direct = tryParseCode(text);
+  if (direct) return direct;
+  throw new Error("Not a Flock pairing QR");
+}
+
+function tryParseCode(value: string): string | null {
+  try {
+    const p = parseCode(value);
+    return formatHostCode(p.nameplate, p.words[0], p.words[1]);
+  } catch {
+    return null;
+  }
+}
+
+function codeFromQuery(qs: string): string | null {
+  const params = new URLSearchParams(qs);
+  const c = params.get("c") || params.get("code");
+  if (c) {
+    const direct = tryParseCode(c);
+    if (direct) return direct;
+    const n = params.get("n") || params.get("nameplate");
+    if (n) {
+      const combined = tryParseCode(`${n}-${c}`);
+      if (combined) return combined;
+    }
+  }
+  const n = params.get("n") || params.get("nameplate");
+  const w = params.get("w") || params.get("words");
+  if (n && w) return tryParseCode(`${n}-${w}`);
+  return null;
+}
+
 /** HKDF info string binding the session key to the exact code shown to both humans. */
 export function sessionKeyInfo(nameplate: string, w1: string, w2: string): string {
   return `flock-pair:${nameplate}:${w1}:${w2}`;

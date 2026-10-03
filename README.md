@@ -106,16 +106,15 @@ The folder name must be exactly `obsidian-gdrive-sync` (the plugin id). Restart 
 
 Do this once per device. You need two devices with the plugin installed and the relay reachable.
 
-**On the first device (the host):**
+**On the computer (the host):**
 
 1. Open **Settings → Flock Sync**.
-2. Under **Pair a device**, tap **Start pairing**.
-3. The plugin shows a **nameplate** (3 digits), **two words**, the full code (e.g. `123-able-acid`), and a **QR code**.
+2. Tap **Start pair**. Leave that screen up — it shows a **nameplate**, two words, the full code (e.g. `123-able-acid`), and a **QR code**.
 
-**On the second device (the guest):**
+**On the phone (the guest):**
 
-1. Open **Settings → Flock Sync**.
-2. Under **I have a code**, enter the code shown on the host (e.g. `123-able-acid`) and tap **Join** — or scan the host's QR code with your phone camera; it opens the deep link `obsidian://flock-sync?n=<nameplate>&c=<code>` and lands you in the pairing flow.
+1. Open **Settings → Flock Sync**. Do **not** tap Start pair / Show a code — that would draw a second QR with nothing to scan.
+2. Tap **Scan QR** and point the camera at the computer's QR. You can also type the code under **I have a code** and tap **Join**.
 3. Both screens now show **three check words** (the fingerprint). Compare them.
 4. If they match on both devices, tap **Pair** on both.
 

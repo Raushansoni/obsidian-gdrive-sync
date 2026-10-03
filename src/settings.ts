@@ -3,6 +3,7 @@ import type FlockSyncPlugin from "./main";
 import { DEFAULT_RELAY_URL } from "./flock-url";
 import { relayUrlProblem } from "./relay-url";
 import { renderQrSvg } from "./pair/qr";
+import { QrLiveScanner } from "./pair/scan-qr";
 import type { HostStartInfo } from "./pair/session";
 import type { DeviceRecord } from "./protocol";
 
@@ -63,6 +64,7 @@ export class FlockSettingTab extends PluginSettingTab {
   private pairingPoll: ReturnType<typeof setInterval> | null = null;
   private lastPairingSnapshot = "";
   private joinCodeDraft = "";
+  private qrScanner = new QrLiveScanner();
 
   constructor(app: App, plugin: FlockSyncPlugin) {
     super(app, plugin);
@@ -71,6 +73,7 @@ export class FlockSettingTab extends PluginSettingTab {
 
   hide(): void {
     this.stopPairingPoll();
+    this.qrScanner.stop();
     if (this.plugin.refreshSettingsTab === this.redisplay) {
       this.plugin.refreshSettingsTab = null;
     }
@@ -183,24 +186,40 @@ export class FlockSettingTab extends PluginSettingTab {
 
     const choose = wrap.createDiv({ cls: "flock-pair-choose" });
     choose.createEl("h3", { text: "Pair a device" });
-    choose.createEl("p", {
-      text: "Pair this device with your phone or another computer. Pairing is end-to-end encrypted; compare the three check words on both screens before confirming.",
-    });
 
-    new Setting(choose)
-      .setName("Start pairing")
-      .setDesc("Show a nameplate, two words and a QR here. Enter them on the other device.")
-      .addButton((btn) =>
-        btn.setButtonText("Start pair").setCta().onClick(async () => {
-          btn.setDisabled(true);
-          try {
-            await this.plugin.pairing.startHost();
-          } catch (e) {
-            new Notice(`Pair start failed: ${errMsg(e)}`, 8000);
-          }
-          this.display();
-        })
-      );
+    if (Platform.isMobile) {
+      choose.createEl("p", {
+        text: "This phone scans the computer. Leave the QR on the PC, then tap Scan QR here — do not start pairing on both devices.",
+      });
+      const scanBtn = choose.createEl("button", {
+        text: "Scan QR",
+        cls: "mod-cta flock-scan-btn",
+      });
+      scanBtn.type = "button";
+      scanBtn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        void this.startQrScan();
+      });
+    } else {
+      choose.createEl("p", {
+        text: "This computer shows a QR. On the phone, tap Scan QR — do not tap Start pair on both devices.",
+      });
+      new Setting(choose)
+        .setName("Start pairing")
+        .setDesc("Show a nameplate, two words and a QR here. Scan them on the phone.")
+        .addButton((btn) =>
+          btn.setButtonText("Start pair").setCta().onClick(async () => {
+            btn.setDisabled(true);
+            try {
+              await this.plugin.pairing.startHost();
+            } catch (e) {
+              new Notice(`Pair start failed: ${errMsg(e)}`, 8000);
+            }
+            this.display();
+          })
+        );
+    }
 
     new Setting(choose)
       .setName("I have a code")
@@ -219,24 +238,86 @@ export class FlockSettingTab extends PluginSettingTab {
             return;
           }
           btn.setDisabled(true);
-          const fingerprint = await this.plugin.pairing.join(code);
-          btn.setDisabled(false);
-          const pairing = this.plugin.pairing;
-          if (!fingerprint || pairing.phase === "error") {
-            new Notice(
-              `Join failed: ${pairing.error ?? "no fingerprint — check the code and try again"}`,
-              8000
-            );
-          }
-          this.display();
+          await this.joinWithCode(code);
         })
       );
+
+    if (!Platform.isMobile) {
+      new Setting(choose)
+        .setName("Scan QR with webcam")
+        .setDesc("If this computer is joining a phone that is showing the code.")
+        .addButton((btn) =>
+          btn.setButtonText("Scan QR").onClick(() => {
+            void this.startQrScan();
+          })
+        );
+    } else {
+      new Setting(choose)
+        .setName("This phone shows the code")
+        .setDesc("Only if the other device will scan this phone. Normally the computer shows the QR.")
+        .addButton((btn) =>
+          btn.setButtonText("Show a code").onClick(async () => {
+            btn.setDisabled(true);
+            try {
+              await this.plugin.pairing.startHost();
+            } catch (e) {
+              new Notice(`Pair start failed: ${errMsg(e)}`, 8000);
+            }
+            this.display();
+          })
+        );
+    }
+  }
+
+  private async joinWithCode(code: string): Promise<void> {
+    const fingerprint = await this.plugin.pairing.join(code);
+    const pairing = this.plugin.pairing;
+    if (!fingerprint || pairing.phase === "error") {
+      new Notice(
+        `Join failed: ${pairing.error ?? "no fingerprint — check the code and try again"}`,
+        8000
+      );
+    }
+    this.display();
+  }
+
+  private async startQrScan(): Promise<void> {
+    if (this.qrScanner.active) return;
+    await this.qrScanner.open({
+      onCode: (code) => {
+        this.joinCodeDraft = code;
+        new Notice("QR scanned — connecting…");
+        void this.joinWithCode(code);
+      },
+      onCancel: () => {
+        if (this.containerEl?.isConnected) this.display();
+      },
+    });
   }
 
   private renderHostPanel(wrap: HTMLElement, host: HostStartInfo): void {
     const pairing = this.plugin.pairing;
 
     wrap.createEl("h3", { text: "Pairing — enter this on your other device" });
+
+    if (Platform.isMobile) {
+      wrap.createEl("p", {
+        cls: "mod-warning",
+        text: "This phone is showing a QR. To join the computer, scan the computer's code instead.",
+      });
+      const scanInstead = wrap.createEl("button", {
+        text: "Scan the computer's QR instead",
+        cls: "mod-cta flock-scan-btn",
+      });
+      scanInstead.type = "button";
+      scanInstead.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        this.plugin.pairing.cancel();
+        this.stopPairingPoll();
+        void this.startQrScan();
+      });
+    }
 
     const codeBox = wrap.createDiv({ cls: "flock-pair-code" });
     const nameplateEl = codeBox.createDiv({ cls: "flock-nameplate" });
