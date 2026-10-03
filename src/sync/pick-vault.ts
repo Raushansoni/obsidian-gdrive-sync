@@ -58,3 +58,22 @@ export function pickRichestVault(heads: Array<{ vaultId: string; head: number }>
 export function shouldEnqueueLocalPath(tip: { hash: string | null } | null | undefined): boolean {
   return !tip || tip.hash === null;
 }
+
+/**
+ * Same-name leftover vaults are harmless once this device is already on the
+ * canonical (richest) copy. Warn only when this device still needs to switch.
+ */
+export function forkNeedsJoin(
+  vaults: Array<{
+    vaultId: string;
+    name: string | null;
+    current?: boolean;
+    canonical?: boolean;
+  }>
+): boolean {
+  const current = vaults.find((v) => v.current);
+  if (!current) return false;
+  const forks = vaults.filter((v) => namesMatch(v.name, current.name));
+  if (forks.length <= 1) return false;
+  return current.canonical !== true;
+}

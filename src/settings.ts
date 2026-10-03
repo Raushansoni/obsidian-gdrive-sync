@@ -6,6 +6,8 @@ import { renderQrSvg } from "./pair/qr";
 import { QrLiveScanner } from "./pair/scan-qr";
 import type { HostStartInfo } from "./pair/session";
 import type { DeviceRecord } from "./protocol";
+import { forkNeedsJoin } from "./sync/pick-vault";
+import { showLastError, statusHeadline, visibleStatusLog } from "./status/view";
 
 /** Minimal structural view of StatusMachine so this file compiles independently. */
 interface StatusLike {
@@ -490,30 +492,27 @@ export class FlockSettingTab extends PluginSettingTab {
     wrap.createEl("h3", { text: "This vault is linked." });
 
     const status = (plugin as unknown as { status?: StatusLike }).status;
-    const stateLine = status
-      ? `Status: ${status.state}${status.detail ? ` — ${status.detail}` : ""}`
-      : "Status: ready";
-    wrap.createEl("p", { text: stateLine });
+    wrap.createEl("p", {
+      text: statusHeadline(status?.state ?? "waiting", status?.detail),
+    });
     wrap.createEl("p", {
       text: plugin.data.lastSyncAt
         ? `Last sync: ${new Date(plugin.data.lastSyncAt).toLocaleString()}`
         : "Last sync: never",
     });
-    if (plugin.data.lastError) {
-      wrap.createEl("p", { cls: "mod-warning", text: `Last error: ${plugin.data.lastError}` });
+    const liveError = showLastError(status?.state ?? "waiting", plugin.data.lastError);
+    if (liveError) {
+      wrap.createEl("p", { cls: "mod-warning", text: `Error: ${liveError}` });
     }
     if (plugin.data.vaultId) {
       wrap.createEl("p", { text: `Vault ID: ${plugin.data.vaultId}` });
     }
-    const log = plugin.status.snapshotLog();
+    const log = visibleStatusLog(plugin.status.snapshotLog(), status?.state ?? "waiting");
     if (log.length) {
       const recent = wrap.createDiv({ cls: "flock-status-log" });
       recent.createEl("h4", { text: "Recent sync" });
       recent.createEl("pre", {
-        text: log
-          .slice(-8)
-          .map((e) => e.msg)
-          .join("\n"),
+        text: log.map((e) => e.msg).join("\n"),
       });
     }
 
@@ -538,13 +537,16 @@ export class FlockSettingTab extends PluginSettingTab {
           listEl.setText("No vaults on the relay yet. Tap Link this vault.");
           return;
         }
-        const names = vaults.map((v) => (v.name ?? "").trim().toLowerCase()).filter(Boolean);
-        if (names.length !== new Set(names).size) {
-          listEl.createEl("p", {
-            cls: "mod-warning",
-            text: "Phone and PC linked as two separate vaults with the same name, so files never crossed. Tap Join shared vault (or Sync now) to use the copy that already has notes.",
-          });
+        if (!forkNeedsJoin(vaults)) {
+          const current = vaults.find((v) => v.current);
+          const name = current?.name || this.plugin.app.vault.getName() || "this vault";
+          listEl.setText(`Sharing “${name}”`);
+          return;
         }
+        listEl.createEl("p", {
+          cls: "mod-warning",
+          text: "This device is on a second copy of the same vault, so files are not crossing. Tap Join shared vault to use the copy that already has notes.",
+        });
         for (const v of vaults) {
           const row = new Setting(listEl);
           row.setName(v.name || v.vaultId.slice(0, 8));

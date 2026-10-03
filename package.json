@@ -1,6 +1,6 @@
 {
   "name": "obsidian-gdrive-sync",
-  "version": "2.0.3",
+  "version": "2.0.4",
   "description": "One-click pairing and end-to-end encrypted Obsidian vault sync",
   "main": "main.js",
   "scripts": {
@@ -10,6 +10,7 @@
     "test:phone-pairing": "node scripts/test-phone-pairing.mjs",
     "test:vault-join": "node scripts/test-vault-join.mjs",
     "test:qr-roundtrip": "node scripts/test-qr-roundtrip.mjs",
+    "test:status-view": "node scripts/test-status-view.mjs",
     "setup": "node scripts/setup.mjs",
     "install-to-vault": "node scripts/install-to-vault.mjs"
   },

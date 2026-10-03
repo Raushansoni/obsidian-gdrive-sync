@@ -1,4 +1,5 @@
 import type { PluginData, StatusLogEntry } from "../plugin-data";
+import { isErrorLogMsg } from "./view";
 
 export type SyncStatusName =
   | "synced"
@@ -36,8 +37,16 @@ export class StatusMachine {
     this.lastSyncAt = data && typeof data.lastSyncAt === "number" ? data.lastSyncAt : null;
     const persisted = data && Array.isArray(data.statusLog) ? data.statusLog : [];
     this.log = persisted.slice(-STATUS_LOG_MAX).map((e) => ({ t: e.t, msg: e.msg }));
-    const tail = this.log.length > 0 ? this.log[this.log.length - 1].msg : "";
-    if (tail) this.detail = tail;
+    if (data?.lastError) {
+      this.state = "error";
+      this.detail = data.lastError;
+    } else if (this.lastSyncAt) {
+      this.state = "synced";
+      this.detail = "Synced";
+    } else {
+      const tail = this.log.length > 0 ? this.log[this.log.length - 1].msg : "";
+      if (tail) this.detail = tail;
+    }
     this.onChange?.();
   }
 
@@ -59,15 +68,29 @@ export class StatusMachine {
     if (detail !== undefined) this.detail = detail;
     if (queue !== undefined) this.queue = queue;
     if (state === "synced") {
+      this.dropRecoveredErrors();
       this.lastSyncAt = Date.now();
       const data = this.liveData();
-      if (data) data.lastSyncAt = this.lastSyncAt;
+      if (data) {
+        data.lastSyncAt = this.lastSyncAt;
+        data.lastError = null;
+      }
     }
     this.onChange?.();
   }
 
   /** Push a message into data.statusLog (max 40 entries). Caller saves data. */
   note(msg: string): void {
+    const last = this.log[this.log.length - 1];
+    if (last && last.msg === msg) {
+      last.t = Date.now();
+      const data = this.liveData();
+      const persisted = data?.statusLog;
+      if (persisted && persisted.length > 0 && persisted[persisted.length - 1].msg === msg) {
+        persisted[persisted.length - 1].t = last.t;
+      }
+      return;
+    }
     const entry: StatusLogEntry = { t: Date.now(), msg };
     this.log.push(entry);
     if (this.log.length > STATUS_LOG_MAX) {
@@ -86,5 +109,16 @@ export class StatusMachine {
   /** Copy of the current log tail for display in settings. */
   snapshotLog(): StatusLogEntry[] {
     return this.log.map((e) => ({ t: e.t, msg: e.msg }));
+  }
+
+  /** Successful sync must not keep recovered Error: lines on screen. */
+  private dropRecoveredErrors(): void {
+    this.log = this.log.filter((e) => !isErrorLogMsg(e.msg));
+    const data = this.liveData();
+    if (!data) return;
+    data.lastError = null;
+    if (Array.isArray(data.statusLog)) {
+      data.statusLog = data.statusLog.filter((e) => !isErrorLogMsg(e.msg));
+    }
   }
 }

@@ -38,6 +38,7 @@ const {
   pickRichestVault,
   shouldEnqueueLocalPath,
   namesMatch,
+  forkNeedsJoin,
 } = await import(pathToFileURL(outfile).href);
 
 check("empty flock → mint new", pickVaultToLink([], "NEW", null) === null);
@@ -98,6 +99,20 @@ check("namesMatch rejects empty", !namesMatch("", ""));
 check("new local file is enqueued", shouldEnqueueLocalPath(undefined) === true);
 check("never-synced tombstone is enqueued", shouldEnqueueLocalPath({ hash: null }) === true);
 check("already-synced file is not blindly re-enqueued", shouldEnqueueLocalPath({ hash: "abc" }) === false);
+
+const shared = [
+  { vaultId: "1c1f5d75", name: "NEW", current: false, canonical: false },
+  { vaultId: "1c6e4c02", name: "NEW", current: true, canonical: true },
+];
+check("no join warning once this device is on the canonical vault", forkNeedsJoin(shared) === false);
+check(
+  "join warning while this device is still on the empty fork",
+  forkNeedsJoin([
+    { vaultId: "1c1f5d75", name: "NEW", current: true, canonical: false },
+    { vaultId: "1c6e4c02", name: "NEW", current: false, canonical: true },
+  ]) === true
+);
+check("single vault never warns", forkNeedsJoin([{ vaultId: "only", name: "NEW", current: true, canonical: true }]) === false);
 
 await rm(outfile, { force: true });
 

@@ -21,7 +21,12 @@ import { dirname, normalizeVaultPath } from "../util/paths";
 import { isIgnored, parseIgnorePatterns } from "./ignore";
 import { uniqueConflictPath } from "./conflict";
 import { isConfigPathAllowed, listConfigRelPaths } from "./config-dir";
-import { namesMatch, pickRichestVault, pickVaultToLink, shouldEnqueueLocalPath } from "./pick-vault";
+import {
+  namesMatch,
+  pickRichestVault,
+  pickVaultToLink,
+  shouldEnqueueLocalPath,
+} from "./pick-vault";
 import type { IdentityStore } from "../identity";
 import type { RelayHttp } from "../relay/client";
 import type { StatusMachine } from "../status/machine";
@@ -269,7 +274,9 @@ export class FlockSyncEngine {
     await this.io.saveData();
   }
 
-  async listNamedVaults(): Promise<Array<{ vaultId: string; name: string | null; current: boolean }>> {
+  async listNamedVaults(): Promise<
+    Array<{ vaultId: string; name: string | null; current: boolean; canonical: boolean }>
+  > {
     const secret = this.identity.flockSecret;
     const current = this.io.getData().vaultId;
     if (!secret) return [];
@@ -279,13 +286,45 @@ export class FlockSyncEngine {
     } catch {
       return [];
     }
-    const out: Array<{ vaultId: string; name: string | null; current: boolean }> = [];
+    const out: Array<{ vaultId: string; name: string | null; current: boolean; canonical: boolean }> =
+      [];
     for (const item of list) {
       out.push({
         vaultId: item.vaultId,
         name: await decodeVaultName(secret, item.sealedMetaB64),
         current: item.vaultId === current,
+        canonical: false,
       });
+    }
+    const groups = new Map<string, typeof out>();
+    for (const v of out) {
+      const key = (v.name ?? "").trim().toLowerCase() || v.vaultId;
+      const g = groups.get(key) ?? [];
+      g.push(v);
+      groups.set(key, g);
+    }
+    for (const g of groups.values()) {
+      if (g.length === 1) {
+        g[0].canonical = true;
+        continue;
+      }
+      const heads: Array<{ vaultId: string; head: number }> = [];
+      for (const v of g) {
+        try {
+          const m = await this.relay.merkle(v.vaultId);
+          heads.push({ vaultId: v.vaultId, head: typeof m.head === "number" ? m.head : 0 });
+        } catch {
+          heads.push({ vaultId: v.vaultId, head: 0 });
+        }
+      }
+      if (heads.some((h) => h.head > 0)) {
+        const id = pickRichestVault(heads);
+        const row = out.find((v) => v.vaultId === id);
+        if (row) row.canonical = true;
+      } else {
+        const enrolled = g.find((v) => v.current) ?? g[0];
+        enrolled.canonical = true;
+      }
     }
     return out;
   }
@@ -567,12 +606,10 @@ export class FlockSyncEngine {
       } else {
         this.status.set("synced", "Synced", 0);
       }
-      if (pushedCount > 0 || appliedCount > 0) {
-        this.status.note(
-          `Sync ok — pushed ${pushedCount}, applied ${appliedCount}` +
-            (conflictCount > 0 ? `, ${conflictCount} conflict(s)` : "")
-        );
-      }
+      this.status.note(
+        `Sync ok — pushed ${pushedCount}, applied ${appliedCount}` +
+          (conflictCount > 0 ? `, ${conflictCount} conflict(s)` : "")
+      );
       await this.io.saveData();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);

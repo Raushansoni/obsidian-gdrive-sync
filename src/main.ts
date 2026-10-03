@@ -20,6 +20,7 @@ export default class FlockSyncPlugin extends Plugin {
   private statusBarEl: HTMLElement | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   refreshSettingsTab: (() => void) | null = null;
+  private lastPaintedState: string | null = null;
 
   async onload(): Promise<void> {
     await this.loadPluginData();
@@ -198,6 +199,10 @@ export default class FlockSyncPlugin extends Plugin {
     } else text = "Flock: Ready";
     this.statusBarEl.setText(text);
     this.statusBarEl.title = this.status.detail || text;
+    if (this.lastPaintedState === "error" && s !== "error") {
+      this.refreshSettingsTab?.();
+    }
+    this.lastPaintedState = s;
   }
 }
 
