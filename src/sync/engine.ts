@@ -266,12 +266,36 @@ export class FlockSyncEngine {
     await this.relay.vaultEnroll({ vaultId, sealedMetaB64 });
     data.vaultId = vaultId;
     data.enrolled = true;
+    this.clearLocalSyncState(data);
+    this.status.note(reason);
+    await this.io.saveData();
+  }
+
+  /**
+   * Drop cursor/tips so the next sync() replays the relay log and re-uploads
+   * local files. Use when Drift shows cursor > relay head and re-pair did nothing
+   * (pairing never clears vault sync state in data.json).
+   */
+  async resyncFromRelay(): Promise<void> {
+    const data = this.io.getData();
+    if (!this.identity.hasFlock() || !data.enrolled || !data.vaultId) {
+      throw new Error("Pair and link this vault first");
+    }
+    this.clearLocalSyncState(data);
+    this.status.note("Resync from relay — replaying log and re-uploading local notes");
+    this.status.set("waiting", "Resyncing…");
+    await this.io.saveData();
+    await this.sync();
+  }
+
+  private clearLocalSyncState(data: PluginData): void {
     data.localCursor = 0;
     data.pathTips = {};
     data.lastHlc = null;
     this.configStatCache.clear();
-    this.status.note(reason);
-    await this.io.saveData();
+    this.pendingLocal.clear();
+    this.pendingDeletes.clear();
+    this.pendingRenames.length = 0;
   }
 
   async listNamedVaults(): Promise<
@@ -384,7 +408,18 @@ export class FlockSyncEngine {
       const { vaultId, secret, deviceId } = ctx;
 
       // ---------------- Pull remote ops (seq > localCursor), apply in order
-      const pull = await this.pullOps(vaultId, data);
+      let pull = await this.pullOps(vaultId, data);
+      // Cursor ahead of relay head = ghost state (wiped/replaced relay, or
+      // switched URL while data.json kept the old cursor). Pull asks for
+      // seq > cursor and gets nothing forever — replay from 0.
+      if (typeof pull.head === "number" && data.localCursor > pull.head) {
+        this.status.note(
+          `Relay log shorter than local cursor (${data.localCursor} → head ${pull.head}) — replaying`
+        );
+        this.clearLocalSyncState(data);
+        await this.io.saveData();
+        pull = await this.pullOps(vaultId, data);
+      }
       for (const op of pull.ops) {
         if (typeof op.seq === "number" && op.seq > data.localCursor) {
           data.localCursor = op.seq;

@@ -727,12 +727,34 @@ export class FlockSettingTab extends PluginSettingTab {
         area.inputEl.cols = 40;
       });
 
-    new Setting(containerEl).setName("Actions").addButton((btn) =>
-      btn.setButtonText("Sync now").setCta().onClick(async () => {
-        await plugin.syncNow();
-        if (this.containerEl?.isConnected) this.display();
-      })
-    );
+    new Setting(containerEl)
+      .setName("Actions")
+      .addButton((btn) =>
+        btn.setButtonText("Sync now").setCta().onClick(async () => {
+          await plugin.syncNow();
+          if (this.containerEl?.isConnected) this.display();
+        })
+      )
+      .addButton((btn) =>
+        btn.setButtonText("Resync from relay").onClick(async () => {
+          if (!plugin.identity.hasFlock() || !plugin.data.enrolled) {
+            new Notice("Pair and link this vault first");
+            return;
+          }
+          btn.setDisabled(true);
+          try {
+            new Notice("Resyncing from relay…");
+            await plugin.engine?.resyncFromRelay();
+            if (plugin.status.state === "synced") new Notice("Resync complete");
+            else if (plugin.status.state === "error") {
+              new Notice(`Resync error: ${plugin.status.detail}`, 8000);
+            }
+          } catch (e) {
+            new Notice(`Resync failed: ${errMsg(e)}`, 8000);
+          }
+          if (this.containerEl?.isConnected) this.display();
+        })
+      );
   }
 
   // -------------------------------------------------------------- polling

@@ -63,6 +63,11 @@ export default class FlockSyncPlugin extends Plugin {
       name: "Link this vault to flock",
       callback: () => void this.linkVault(),
     });
+    this.addCommand({
+      id: "flock-resync-from-relay",
+      name: "Resync from relay",
+      callback: () => void this.resyncFromRelay(),
+    });
 
     this.addSettingTab(new FlockSettingTab(this.app, this));
 
@@ -162,6 +167,25 @@ export default class FlockSyncPlugin extends Plugin {
       if (notify && this.status.state === "conflict") new Notice(`Conflicts: ${this.status.detail}`);
     } catch (e) {
       new Notice(`Sync failed: ${String(e)}`, 8000);
+    }
+  }
+
+  async resyncFromRelay(): Promise<void> {
+    if (!this.identity.hasFlock()) {
+      new Notice("Pair a device first");
+      return;
+    }
+    if (!this.data.enrolled) {
+      new Notice("Link this vault in settings");
+      return;
+    }
+    try {
+      new Notice("Resyncing from relay…");
+      await this.engine?.resyncFromRelay();
+      if (this.status.state === "synced") new Notice("Resync complete");
+      if (this.status.state === "error") new Notice(`Resync error: ${this.status.detail}`, 8000);
+    } catch (e) {
+      new Notice(`Resync failed: ${String(e)}`, 8000);
     }
   }
 
