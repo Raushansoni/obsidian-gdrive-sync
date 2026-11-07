@@ -1,13 +1,12 @@
 import { App, TAbstractFile, TFile, TFolder, normalizePath } from "obsidian";
 import type { PathTip, PluginData } from "../plugin-data";
-import type { SignedOp } from "../protocol";
+import type { OpsPullResponse, SignedOp } from "../protocol";
 import { MAX_BLOB_BYTES } from "../protocol";
 import { seal, sealDeterministic, sealJson, open, openJson } from "../crypto/box";
 import { b64ToBytes, bytesToB64, fromUtf8, utf8 } from "../crypto/bytes";
 import { hkdf } from "../crypto/hkdf";
 import {
   bumpVv,
-  concurrent,
   dominates,
   packHlc,
   parseHlc,
@@ -17,15 +16,14 @@ import {
 import { canonicalOpMessage } from "../crypto/op-canonical";
 import { signBytes } from "../crypto/p256";
 import { sha256Hex } from "../util/hash";
-import { dirname, normalizeVaultPath } from "../util/paths";
+import { basename, dirname, normalizeVaultPath } from "../util/paths";
 import { isIgnored, parseIgnorePatterns } from "./ignore";
-import { uniqueConflictPath } from "./conflict";
-import { isConfigPathAllowed, listConfigRelPaths } from "./config-dir";
+import { isConfigPathAllowed } from "./config-dir";
+import { covers, isHash, isSyncPath, pathTipsHash, relayRoot, validateHead, validatePull } from "./relay-state";
 import {
   namesMatch,
   pickRichestVault,
   pickVaultToLink,
-  shouldEnqueueLocalPath,
 } from "./pick-vault";
 import type { IdentityStore } from "../identity";
 import { RelayError, type RelayHttp } from "../relay/client";
@@ -33,15 +31,35 @@ import type { StatusMachine } from "../status/machine";
 import type { VaultListItem } from "../protocol";
 
 const WATCH_DEBOUNCE_MS = 1200;
-const PULL_PAGE_LIMIT = 200; // relay returns at most this many ops per pull
 const QUEUED_RERUN_MS = 250;
+const MAX_CATCH_UP_PASSES = 3;
 
 interface OpCtx {
   vaultId: string;
   secret: Uint8Array;
   deviceId: string;
   ecdsaPriv: CryptoKey;
+  relay: RelayHttp;
+  scope: string;
+  assertCurrent(): void;
 }
+
+interface SyncProgress {
+  applied: number;
+  pushed: number;
+  conflicts: number;
+  rebuilt: boolean;
+}
+
+interface PreparedOp {
+  path: string;
+  op: SignedOp;
+  revision: number;
+}
+
+class CatchUpNeeded extends Error {}
+class RebuildNeeded extends Error {}
+class ContextChanged extends Error {}
 
 /**
  * FlockSyncEngine — end-to-end encrypted vault sync over the Flock relay.
@@ -52,11 +70,10 @@ interface OpCtx {
  * plaintext's sha256 (`blob:<hash>`), so identical content dedupes on the
  * relay and integrity is verifiable after decryption.
  *
- * Conflict policy (no last-write-wins): when the local tip's version vector
- * is concurrent with an incoming op and the contents actually differ, the
- * incoming bytes are written to a sibling `(conflict …)` file and the local
- * version is kept. If the incoming op dominates, or the local copy is
- * unmodified relative to our own tip, the remote version overwrites local.
+ * Conflict policy (no last-write-wins): preserve divergent/untracked local
+ * bytes, retain differing incoming bytes as a real conflict file, then publish
+ * merged causal knowledge. Only a dominating op over unchanged tracked bytes
+ * may overwrite or delete them. Recovery reconciles latest state, not history.
  *
  * Note on `document.hidden`: sync() never early-returns for hidden windows —
  * mobile/background sync relies on the plugin calling sync() on
@@ -84,13 +101,14 @@ export class FlockSyncEngine {
 
   private pendingLocal = new Set<string>();
   private pendingDeletes = new Set<string>();
+  private explicitDeletes = new Set<string>();
+  private pathRevisions = new Map<string, number>();
+  private recoveryRequested = false;
+  private activeContext: OpCtx | null = null;
   private pendingRenames: Array<{ oldPath: string; newPath: string }> = [];
 
   private ignoreRaw = "";
   private ignorePatterns: string[] = [];
-
-  /** mtime/size of config files already hashed this session; avoids re-hashing plugins/** every sync. */
-  private configStatCache = new Map<string, { mtime: number; size: number }>();
 
   constructor(
     app: App,
@@ -120,7 +138,10 @@ export class FlockSyncEngine {
     const path = normalizeVaultPath(file.path);
     if (this.isConfigPath(path)) return; // config files are scanned, not evented
     if (this.shouldIgnore(path)) return;
+    this.markLocalChange(path);
     this.pendingLocal.add(path);
+    this.pendingDeletes.delete(path);
+    this.explicitDeletes.delete(path);
     this.scheduleSync();
   }
 
@@ -130,11 +151,18 @@ export class FlockSyncEngine {
     if (this.isConfigPath(path)) return;
     if (this.shouldIgnore(path)) return;
     if (file instanceof TFolder) {
-      // Children no longer fire events; scanMissingFiles() derives tombstones
-      // from pathTips at sync time.
+      // Preserve explicit intent even if a metadata rebuild is queued next.
+      for (const child of Object.keys(this.io.getData().pathTips)) {
+        if (!child.startsWith(path + "/")) continue;
+        this.markLocalChange(child);
+        this.explicitDeletes.add(child);
+        this.pendingDeletes.add(child);
+      }
       this.scheduleSync();
       return;
     }
+    this.markLocalChange(path);
+    this.explicitDeletes.add(path);
     this.pendingLocal.delete(path);
     this.pendingDeletes.add(path);
     this.scheduleSync();
@@ -154,6 +182,9 @@ export class FlockSyncEngine {
         const oldChild = from + p.slice(to.length);
         if (this.shouldIgnore(oldChild) && this.shouldIgnore(p)) continue;
         this.pendingRenames.push({ oldPath: oldChild, newPath: p });
+        this.markLocalChange(oldChild);
+        this.markLocalChange(p);
+        this.explicitDeletes.add(oldChild);
         this.pendingLocal.add(p);
         this.pendingDeletes.delete(p);
       }
@@ -162,6 +193,9 @@ export class FlockSyncEngine {
     }
     if (!(file instanceof TFile)) return;
     this.pendingRenames.push({ oldPath: from, newPath: to });
+    this.markLocalChange(from);
+    this.markLocalChange(to);
+    this.explicitDeletes.add(from);
     this.pendingLocal.add(to);
     this.pendingDeletes.delete(to);
     this.scheduleSync();
@@ -169,7 +203,9 @@ export class FlockSyncEngine {
 
   private scheduleSync(delayMs = WATCH_DEBOUNCE_MS): void {
     if (!this.io.getData().autoSync) {
-      if (this.status.state !== "paused") this.status.set("paused", "Auto-sync is off");
+      if (!this.running && this.status.state !== "error" && this.status.state !== "paused") {
+        this.status.set("paused", "Auto-sync is off");
+      }
       return;
     }
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
@@ -180,6 +216,10 @@ export class FlockSyncEngine {
   }
 
   // ------------------------------------------------------------------ link
+
+  private markLocalChange(path: string): void {
+    this.pathRevisions.set(path, (this.pathRevisions.get(path) ?? 0) + 1);
+  }
 
   /** Enroll this vault with the relay under the paired flock. */
   async linkVault(): Promise<void> {
@@ -215,16 +255,18 @@ export class FlockSyncEngine {
    * If this flock already has a vault with our name (or only one vault),
    * join that log instead of minting a second UUID.
    */
-  private async resolveSharedVaultId(): Promise<string> {
+  private async resolveSharedVaultId(ctx?: OpCtx): Promise<string> {
     const data = this.io.getData();
-    const secret = this.identity.flockSecret;
+    const secret = ctx?.secret ?? this.identity.flockSecret;
+    const relay = ctx?.relay ?? this.relay;
     const localName = this.app.vault.getName();
     if (!secret) return data.vaultId || crypto.randomUUID();
 
     let list: VaultListItem[] = [];
     try {
-      list = await this.relay.vaultList();
+      list = await relay.vaultList();
     } catch {
+      ctx?.assertCurrent();
       list = [];
     }
     const named = [];
@@ -240,9 +282,10 @@ export class FlockSyncEngine {
       const heads: Array<{ vaultId: string; head: number }> = [];
       for (const v of sameName) {
         try {
-          const m = await this.relay.merkle(v.vaultId);
+          const m = await relay.merkle(v.vaultId);
           heads.push({ vaultId: v.vaultId, head: typeof m.head === "number" ? m.head : 0 });
         } catch {
+          ctx?.assertCurrent();
           heads.push({ vaultId: v.vaultId, head: 0 });
         }
       }
@@ -256,46 +299,39 @@ export class FlockSyncEngine {
 
   /** Move this device onto an existing flock vault and replay its log from seq 0. */
   async adoptVault(vaultId: string, reason: string): Promise<void> {
-    const data = this.io.getData();
-    const secret = this.identity.flockSecret;
+    if (this.running) throw new Error("Sync is running — join the vault after it finishes");
+    await this.switchVault(vaultId, reason);
+  }
+
+  private async switchVault(vaultId: string, reason: string, ctx?: OpCtx): Promise<void> {
+    const secret = ctx?.secret ?? this.identity.flockSecret;
     if (!secret) throw new Error("Pair a device first");
     const sealedMetaB64 = await sealJson(secret, {
       name: this.app.vault.getName(),
       createdAt: Date.now(),
     });
-    await this.relay.vaultEnroll({ vaultId, sealedMetaB64 });
+    ctx?.assertCurrent();
+    await (ctx?.relay ?? this.relay).vaultEnroll({ vaultId, sealedMetaB64 });
+    ctx?.assertCurrent();
+    const data = this.io.getData();
     data.vaultId = vaultId;
     data.enrolled = true;
-    this.clearLocalSyncState(data);
+    data.relayState = null;
+    if (ctx) this.activeContext = await this.opCtx();
     this.status.note(reason);
-    await this.io.saveData();
+    await this.checkpoint();
   }
 
-  /**
-   * Drop cursor/tips so the next sync() replays the relay log and re-uploads
-   * local files. Use when Drift shows cursor > relay head and re-pair did nothing
-   * (pairing never clears vault sync state in data.json).
-   */
+  /** Queue a read-only metadata rebuild; never clear state under an active sync. */
   async resyncFromRelay(): Promise<void> {
     const data = this.io.getData();
     if (!this.identity.hasFlock() || !data.enrolled || !data.vaultId) {
       throw new Error("Pair and link this vault first");
     }
-    this.clearLocalSyncState(data);
-    this.status.note("Resync from relay — replaying log and re-uploading local notes");
-    this.status.set("waiting", "Resyncing…");
-    await this.io.saveData();
+    this.recoveryRequested = true;
+    this.status.note("Resync from relay — rebuilding metadata, preserving local notes");
+    if (!this.running) this.status.set("waiting", "Resyncing…");
     await this.sync();
-  }
-
-  private clearLocalSyncState(data: PluginData): void {
-    data.localCursor = 0;
-    data.pathTips = {};
-    data.lastHlc = null;
-    this.configStatCache.clear();
-    this.pendingLocal.clear();
-    this.pendingDeletes.clear();
-    this.pendingRenames.length = 0;
   }
 
   async listNamedVaults(): Promise<
@@ -362,8 +398,6 @@ export class FlockSyncEngine {
     }
     const data = this.io.getData();
     this.refreshIgnore(data);
-    if (!data.pathTips) data.pathTips = {};
-    if (!data.statusLog) data.statusLog = [];
 
     if (!this.identity.hasFlock() || !this.identity.flockSecret) {
       this.status.set("waiting", "Pair a device first");
@@ -377,290 +411,98 @@ export class FlockSyncEngine {
       this.status.set("waiting", "Offline — will sync when back online");
       return;
     }
-    const ctx = this.opCtx();
-    if (!ctx) {
-      this.status.set("error", "Missing device identity");
-      return;
-    }
-
     this.running = true;
+    if (this.debounceTimer) clearTimeout(this.debounceTimer);
+    this.debounceTimer = null;
+    const forceRecovery = this.recoveryRequested;
+    this.recoveryRequested = false;
     const queuedCount =
       this.pendingLocal.size + this.pendingDeletes.size + this.pendingRenames.length;
     this.status.set("syncing", "Syncing…", queuedCount);
 
-    let appliedCount = 0;
-    let pushedCount = 0;
-    let conflictCount = 0;
+    const progress: SyncProgress = { applied: 0, pushed: 0, conflicts: 0, rebuilt: false };
+    let completed = false;
+    const previousSyncAt = this.status.lastSyncAt;
 
     try {
-      const sharedId = await this.resolveSharedVaultId();
-      if (data.vaultId && sharedId !== data.vaultId) {
-        await this.adoptVault(
+      let ctx = await this.opCtx();
+      if (!ctx) throw new Error("Missing device identity");
+      this.activeContext = ctx;
+      ctx.assertCurrent();
+      const sharedId = await this.resolveSharedVaultId(ctx);
+      ctx.assertCurrent();
+      if (this.io.getData().vaultId && sharedId !== this.io.getData().vaultId) {
+        await this.switchVault(
           sharedId,
-          `Joined the shared "${this.app.vault.getName()}" vault so notes can move between devices`
+          `Joined the shared "${this.app.vault.getName()}" vault so notes can move between devices`, ctx
         );
+        ctx = this.activeContext!;
       }
-      const ctx = this.opCtx();
-      if (!ctx) {
-        this.status.set("error", "Missing device identity");
-        return;
-      }
-      const { vaultId, secret, deviceId } = ctx;
-
-      // ---------------- Pull remote ops (seq > localCursor), apply in order
-      let pull = await this.pullOps(vaultId, data);
-      // Cursor ahead of relay head = ghost state (wiped/replaced relay, or
-      // switched URL while data.json kept the old cursor). Pull asks for
-      // seq > cursor and gets nothing forever — replay from 0.
-      if (typeof pull.head === "number" && data.localCursor > pull.head) {
-        this.status.note(
-          `Relay log shorter than local cursor (${data.localCursor} → head ${pull.head}) — replaying`
-        );
-        this.clearLocalSyncState(data);
-        await this.io.saveData();
-        pull = await this.pullOps(vaultId, data);
-      }
-      for (const op of pull.ops) {
-        if (typeof op.seq === "number" && op.seq > data.localCursor) {
-          data.localCursor = op.seq;
-        }
-
-        // Keep our hybrid logical clock monotonic against remote ops.
-        try {
-          const local = data.lastHlc ? parseHlc(data.lastHlc) : null;
-          data.lastHlc = packHlc(recvHlc(local, parseHlc(op.hlc), deviceId));
-        } catch {
-          /* malformed remote hlc — ignore */
-        }
-
-        let path: string;
-        try {
-          path = normalizeVaultPath(fromUtf8(await open(secret, op.pathCipherB64, vaultId)));
-        } catch {
-          this.status.note("Skipped one op with an undecryptable path");
-          continue;
-        }
-        if (!path) continue;
-
-        const opVv = op.versionVector ?? {};
-        if (this.shouldIgnore(path)) continue;
-        if (this.isConfigPath(path) && !isConfigPathAllowed(path, this.configDir)) continue;
-
-        const tip: PathTip | null = data.pathTips[path] ?? null;
-
-        if (op.blobHash === null) {
-          // Tombstone — delete the local file if it exists.
-          if (await this.localPathExists(path)) {
-            await this.withWatchSuppressed(() => this.deleteLocalPath(path));
-          }
-          data.pathTips[path] = { hash: null, vv: mergeVv(tip?.vv, opVv) };
-          this.pendingLocal.delete(path);
-          this.pendingDeletes.delete(path);
-          appliedCount++;
-          continue;
-        }
-
-        let bytes: Uint8Array;
-        try {
-          const packed = await this.relay.getBlob(vaultId, op.blobHash);
-          const blobKey = await hkdf(secret, `blob:${op.blobHash}`, 32);
-          bytes = await open(blobKey, bytesToB64(new Uint8Array(packed)));
-        } catch {
-          this.status.note(`Could not fetch/decrypt blob for ${path}`);
-          continue;
-        }
-        const contentHash = await sha256Hex(bytes);
-        if (contentHash !== op.blobHash) {
-          this.status.note(`Checksum mismatch for ${path} — op skipped`);
-          continue;
-        }
-
-        const localHash = await this.hashLocalPath(path);
-        if (localHash === contentHash) {
-          // Already identical — record merged knowledge, no write needed.
-          data.pathTips[path] = { hash: contentHash, vv: mergeVv(tip?.vv, opVv) };
-          this.pendingLocal.delete(path);
-          this.pendingDeletes.delete(path);
-          appliedCount++;
-          continue;
-        }
-
-        const incomingDominates = dominates(opVv, tip?.vv ?? {});
-        const localUnchanged = !tip || tip.hash === localHash;
-
-        if (incomingDominates || localUnchanged) {
-          // Remote wins, or our copy never diverged from the tip — overwrite.
-          await this.withWatchSuppressed(async () => {
-            await this.writeLocalBytes(path, bytes);
-          });
-          this.configStatCache.delete(path);
-          data.pathTips[path] = { hash: contentHash, vv: mergeVv(tip?.vv, opVv) };
-          this.pendingLocal.delete(path);
-          this.pendingDeletes.delete(path);
-          appliedCount++;
-          continue;
-        }
-
-        // Local tip outranks the incoming op — keep local; push phase syncs it.
-        if (concurrent(tip?.vv ?? {}, opVv)) {
-          // True divergence: keep local, save the remote bytes as a sibling
-          // conflict copy. Never last-write-wins.
-          const conflictTarget = uniqueConflictPath(path, (p) =>
-            Boolean(this.app.vault.getAbstractFileByPath(p))
-          );
-          await this.withWatchSuppressed(async () => {
-            await this.writeLocalBytes(conflictTarget, bytes);
-          });
-          this.configStatCache.delete(conflictTarget);
-          if (!this.shouldIgnore(conflictTarget)) this.pendingLocal.add(conflictTarget);
-          this.status.note(`Conflict: ${path} — kept local, saved remote as ${conflictTarget}`);
-          conflictCount++;
-          // Merge the incoming vv into our tip so our next push outranks it.
-          data.pathTips[path] = {
-            hash: tip ? tip.hash : localHash,
-            vv: mergeVv(tip?.vv, opVv),
-          };
-          appliedCount++;
-          continue;
-        }
-        // Local dominates the incoming op — it is an older version; skip.
-      }
-      // More pages remain on the relay (pull is limited) — rerun after this pass.
-      if (pull.ops.length > 0 && pull.head > data.localCursor) this.queued = true;
-
-      // ---------------- Fold renames into delete+create pairs
-      const renames = this.pendingRenames.splice(0);
-      for (const { oldPath, newPath } of renames) {
-        if (!this.shouldIgnore(oldPath)) this.pendingDeletes.add(oldPath);
-        if (!this.shouldIgnore(newPath)) this.pendingLocal.add(newPath);
-      }
-
-      // ---------------- Config-dir scan (no vault events fire for these)
-      await this.scanConfigChanges(data);
-
-      // ---------------- Universe scan: file keys = getFiles() + config paths
-      this.scanNewLocalFiles(data); // files never synced (including after joining a shared vault)
-      this.scanMissingFiles(data); // cheap existence check → tombstones
-
-      // ---------------- Push local changes
-      const ops: SignedOp[] = [];
-
-      const deletes = [...this.pendingDeletes];
-      this.pendingDeletes.clear();
-      for (const path of deletes) {
-        if (this.shouldIgnore(path)) continue;
-        const tip: PathTip | null = data.pathTips[path] ?? null;
-        if (!tip || tip.hash === null) continue; // never synced / already tombstoned
-        const op = await this.makeOp(ctx, path, null, tip);
-        ops.push(op);
-        data.pathTips[path] = { hash: null, vv: op.versionVector };
-        pushedCount++;
-      }
-
-      const locals = [...this.pendingLocal];
-      this.pendingLocal.clear();
-      for (const path of locals) {
-        if (this.shouldIgnore(path)) continue;
-        const isConfig = this.isConfigPath(path);
-        if (isConfig && !isConfigPathAllowed(path, this.configDir)) continue;
-        const tip: PathTip | null = data.pathTips[path] ?? null;
-
-        let bytes: Uint8Array | null;
-        if (isConfig) {
-          bytes = await this.readLocalBytes(path);
-        } else {
-          const file = this.app.vault.getAbstractFileByPath(path);
-          if (!(file instanceof TFile)) {
-            // Vanished mid-queue — fall back to a delete if it was synced.
-            if (tip && tip.hash !== null) this.pendingDeletes.add(path);
-            continue;
-          }
-          await this.flushOpenEditors(path);
-          bytes = new Uint8Array(await this.app.vault.readBinary(file));
-        }
-        if (!bytes) {
-          if (tip && tip.hash !== null) this.pendingDeletes.add(path);
-          continue;
-        }
-
-        const hash = await sha256Hex(bytes);
-        if (tip && tip.hash === hash) continue; // unchanged vs tip
-        if (bytes.byteLength > MAX_BLOB_BYTES) {
-          this.status.note(
-            `Skipped ${path} — over ${Math.round(MAX_BLOB_BYTES / (1024 * 1024))} MB limit`
-          );
-          continue;
-        }
-
-        const blobKey = await hkdf(secret, `blob:${hash}`, 32);
-        const sealedB64 = await seal(blobKey, bytes);
-        await this.relay.putBlob(vaultId, hash, toArrayBuffer(b64ToBytes(sealedB64)));
-
-        const op = await this.makeOp(ctx, path, hash, tip);
-        ops.push(op);
-        data.pathTips[path] = { hash, vv: op.versionVector };
-        pushedCount++;
-      }
-
-      // Anything re-queued while pushing (vanished files → deletes) reruns once.
-      if (
-        this.pendingLocal.size > 0 ||
-        this.pendingDeletes.size > 0 ||
-        this.pendingRenames.length > 0
-      ) {
-        this.queued = true;
-      }
-
-      if (ops.length > 0) {
-        const res = await this.relay.opsPush(vaultId, { ops });
-        if (typeof res.head === "number" && res.head > data.localCursor) {
-          data.localCursor = res.head;
+      // Verify metadata BEFORE deriving any local deletion from it.
+      await this.ensureVerified(ctx, progress, forceRecovery);
+      for (let pass = 0; pass < MAX_CATCH_UP_PASSES; pass++) {
+        await this.scanLocalChanges();
+        await this.pushLocalChanges(ctx, progress);
+        await this.ensureVerified(ctx, progress);
+        await this.scanLocalChanges();
+        if (!this.pendingLocal.size && !this.pendingDeletes.size && !this.pendingRenames.length) {
+          completed = true;
+          break;
         }
       }
-
-      try {
-        const m = await this.relay.merkle(vaultId);
-        const localRoot = await this.localMerkleRoot(secret, vaultId, data);
-        if (m.root !== localRoot) {
-          this.status.note(
-            `Drift: merkle mismatch (relay head ${m.head}, cursor ${data.localCursor})`
-          );
-        }
-      } catch {
-        /* optional check */
+      if (!completed) throw new CatchUpNeeded("Local changes arrived during sync — catch-up is pending");
+      if (this.io.getData().relayState?.policy !== this.applicationPolicy) {
+        throw new CatchUpNeeded("Sync settings changed — reconciliation is pending");
       }
 
-      // ---------------- Finish
-      data.lastError = null;
-      if (conflictCount > 0) {
+      this.io.getData().lastError = null;
+      await this.checkpoint();
+      ctx.assertCurrent();
+      if (progress.conflicts > 0) {
         this.status.set(
           "conflict",
-          `${conflictCount} conflict file${conflictCount === 1 ? "" : "s"}`,
-          conflictCount
+          `${progress.conflicts} conflict file${progress.conflicts === 1 ? "" : "s"}`,
+          progress.conflicts
         );
       } else {
         this.status.set("synced", "Synced", 0);
       }
       this.status.note(
-        `Sync ok — pushed ${pushedCount}, applied ${appliedCount}` +
-          (conflictCount > 0 ? `, ${conflictCount} conflict(s)` : "")
+        `Sync ok — pushed ${progress.pushed}, applied ${progress.applied}` +
+          (progress.conflicts > 0 ? `, ${progress.conflicts} conflict(s)` : "")
       );
-      await this.io.saveData();
+      await this.checkpoint();
     } catch (e) {
+      try { this.activeContext?.assertCurrent(); } catch (changed) { e = changed; }
+      if (e instanceof ContextChanged) {
+        // Do not save A's projection as verified metadata for B. Keep local
+        // bytes/tips for conservative reconstruction under the next context.
+        this.io.getData().relayState = null;
+        this.io.getData().lastSyncAt = previousSyncAt;
+        this.status.lastSyncAt = previousSyncAt;
+        this.activeContext = null;
+      }
       const msg = e instanceof Error ? e.message : String(e);
-      const data = this.io.getData();
-      data.lastError = msg;
-      this.status.note(`Error: ${msg}`);
-      this.status.set("error", msg);
+      completed = false;
+      if (e instanceof CatchUpNeeded) {
+        this.status.note(msg);
+        this.status.set("waiting", msg);
+      } else {
+        this.io.getData().lastError = msg;
+        this.status.note(`Error: ${msg}`);
+        this.status.set("error", msg);
+      }
       try {
-        await this.io.saveData();
+        await this.checkpoint();
       } catch {
         /* keep the failure visible via status */
       }
     } finally {
+      this.activeContext = null;
       this.running = false;
-      if (this.queued) {
-        this.queued = false;
+      const rerun = this.queued && (completed || this.recoveryRequested);
+      this.queued = false;
+      if (rerun) {
         setTimeout(() => {
           void this.sync();
         }, QUEUED_RERUN_MS);
@@ -669,6 +511,350 @@ export class FlockSyncEngine {
   }
 
   // ------------------------------------------------------------- internals
+
+  /** saveData may replace PluginData. Never retain its object across a checkpoint. */
+  private async checkpoint(): Promise<void> {
+    this.assertRunContext();
+    const state = this.io.getData().relayState;
+    if (state) {
+      const hash = await pathTipsHash(this.io.getData().pathTips);
+      this.assertRunContext();
+      const live = this.io.getData().relayState;
+      if (live) live.pathTipsHash = hash;
+    }
+    await this.io.saveData();
+    this.assertRunContext();
+  }
+
+  private assertRunContext(): void {
+    this.activeContext?.assertCurrent();
+  }
+
+  private async ensureVerified(ctx: OpCtx, progress: SyncProgress, force = false): Promise<void> {
+    ctx.assertCurrent();
+    const data = this.io.getData();
+    if (force || !data.relayState || data.relayState.cursor !== data.localCursor ||
+      data.relayState.context !== ctx.scope ||
+      data.relayState.policy !== this.applicationPolicy ||
+      data.relayState.pathTipsHash !== await pathTipsHash(data.pathTips)) {
+      await this.rebuildRelayState(ctx, progress);
+    }
+    for (let pass = 0; pass < MAX_CATCH_UP_PASSES; pass++) {
+      try {
+        await this.drainPull(ctx, progress);
+      } catch (error) {
+        if (!(error instanceof RebuildNeeded) || progress.rebuilt) throw error;
+        await this.rebuildRelayState(ctx, progress);
+      }
+      const cursor = this.io.getData().localCursor;
+      const root = await relayRoot(this.io.getData().relayState!.tips);
+      // The relay reads rows, awaits hashing, then reads head. Confirm a mismatch
+      // before treating it as corruption; a moving head is only catch-up work.
+      let merkle = await ctx.relay.merkle(ctx.vaultId);
+      validateHead(merkle.head);
+      if (!isHash(merkle.root)) throw new Error("Malformed relay Merkle root");
+      if (merkle.head > cursor) continue;
+      if (merkle.head === cursor && merkle.root === root) {
+        if (this.io.getData().relayState?.policy !== this.applicationPolicy) {
+          throw new CatchUpNeeded("Sync settings changed — reconciliation is pending");
+        }
+        return;
+      }
+      merkle = await ctx.relay.merkle(ctx.vaultId);
+      validateHead(merkle.head);
+      if (!isHash(merkle.root)) throw new Error("Malformed relay Merkle root");
+      if (merkle.head > cursor) continue;
+      if (merkle.head === cursor && merkle.root === root) {
+        if (this.io.getData().relayState?.policy !== this.applicationPolicy) {
+          throw new CatchUpNeeded("Sync settings changed — reconciliation is pending");
+        }
+        return;
+      }
+      if (!progress.rebuilt) {
+        this.status.note("Rebuilding relay metadata after verification failed");
+        await this.rebuildRelayState(ctx, progress);
+        continue;
+      }
+      throw new Error(`Drift: merkle mismatch (relay head ${merkle.head}, cursor ${cursor})`);
+    }
+    throw new CatchUpNeeded("Relay head is moving — catch-up is pending");
+  }
+
+  /** Consume a finite observed prefix, never the unconsumed head of a push response. */
+  private async drainPull(ctx: OpCtx, progress: SyncProgress, target?: number): Promise<void> {
+    ctx.assertCurrent();
+    let pull = await this.pullOps(ctx, this.io.getData().localCursor);
+    validatePull(pull, this.io.getData().localCursor);
+    if (pull.head < this.io.getData().localCursor) throw new RebuildNeeded("Relay log became shorter");
+    const head = target ?? pull.head;
+    validateHead(head);
+    while (this.io.getData().localCursor < head) {
+      if (pull.head < head) throw new RebuildNeeded("Relay log changed during pull");
+      const before = this.io.getData().localCursor;
+      for (const op of pull.ops) {
+        if (op.seq! > head) break;
+        const path = await this.decodePath(ctx, op);
+        await this.applyRemote(ctx, op, path, progress, false);
+        this.observeHlc(op.hlc, ctx.deviceId);
+        const live = this.io.getData();
+        // Only successful application (or a deliberate exclusion) consumes bytes.
+        live.relayState!.tips[op.pathCipherB64] = op.blobHash;
+        live.localCursor = op.seq!;
+        live.relayState!.cursor = op.seq!;
+      }
+      await this.checkpoint();
+      if (this.io.getData().localCursor === before) throw new Error("Relay pull did not reach its advertised head");
+      if (this.io.getData().localCursor < head) {
+        pull = await this.pullOps(ctx, this.io.getData().localCursor);
+        validatePull(pull, this.io.getData().localCursor);
+      }
+    }
+  }
+
+  /** Reconstruct the wire projection, then reconcile causal-maximal state, not superseded history. */
+  private async rebuildRelayState(ctx: OpCtx, progress: SyncProgress): Promise<void> {
+    ctx.assertCurrent();
+    progress.rebuilt = true;
+    this.io.getData().relayState = null;
+    const policy = this.applicationPolicy;
+    const tips: Record<string, string | null> = Object.create(null);
+    const variants = new Map<string, SignedOp[]>();
+    const knowledge = new Map<string, Record<string, number>>();
+    let cursor = 0;
+    let target: number | undefined;
+    let verified = false;
+    let clock = this.io.getData().lastHlc;
+    for (let pass = 0; pass < MAX_CATCH_UP_PASSES; pass++) {
+      let pull = await this.pullOps(ctx, cursor);
+      validatePull(pull, cursor);
+      target ??= pull.head;
+      while (cursor < target) {
+        if (pull.head < target) throw new CatchUpNeeded("Relay log changed during metadata recovery");
+        const before = cursor;
+        for (const op of pull.ops) {
+          if (op.seq! > target) break;
+          tips[op.pathCipherB64] = op.blobHash;
+          variants.set(op.pathCipherB64, retainMaximal(variants.get(op.pathCipherB64) ?? [], op));
+          knowledge.set(op.pathCipherB64, mergeVv(knowledge.get(op.pathCipherB64), op.versionVector));
+          clock = packHlc(recvHlc(clock ? parseHlc(clock) : null, parseHlc(op.hlc), ctx.deviceId));
+          cursor = op.seq!;
+        }
+        if (cursor === before) throw new Error("Relay recovery did not reach its advertised head");
+        if (cursor < target) {
+          pull = await this.pullOps(ctx, cursor);
+          validatePull(pull, cursor);
+        }
+      }
+      const merkle = await ctx.relay.merkle(ctx.vaultId);
+      validateHead(merkle.head);
+      if (!isHash(merkle.root)) throw new Error("Malformed relay Merkle root");
+      if (merkle.head === cursor && merkle.root === await relayRoot(tips)) {
+        verified = true;
+        break;
+      }
+      if (merkle.head < cursor) throw new CatchUpNeeded("Relay log changed during metadata recovery");
+      target = merkle.head;
+      if (pass === MAX_CATCH_UP_PASSES - 1 && merkle.head === cursor) {
+        throw new Error(`Drift: merkle mismatch after metadata recovery (relay head ${merkle.head})`);
+      }
+    }
+    if (!verified) throw new CatchUpNeeded("Relay head is moving — metadata recovery is pending");
+    if (policy !== this.applicationPolicy) throw new CatchUpNeeded("Sync settings changed during metadata recovery");
+
+    const paths = new Map<string, { ops: SignedOp[]; vv: Record<string, number> }>();
+    let pathError: unknown = null;
+    for (const [cipher, ops] of variants) {
+      try {
+        const path = await this.decodePath(ctx, ops[0]);
+        const previous = paths.get(path);
+        let maximal = previous?.ops ?? [];
+        for (const op of ops) maximal = retainMaximal(maximal, op);
+        maximal.sort((a, b) => a.seq! - b.seq!);
+        paths.set(path, { ops: maximal, vv: mergeVv(previous?.vv, knowledge.get(cipher)) });
+      } catch (error) {
+        if (error instanceof ContextChanged) throw error;
+        // Valid paths can still be restored, but the invalid op is NOT acknowledged.
+        pathError ??= error;
+      }
+    }
+    const reconciled: Record<string, PathTip> = Object.create(null);
+    for (const [path, { ops, vv }] of [...paths].sort((a, b) =>
+      a[1].ops[a[1].ops.length - 1].seq! - b[1].ops[b[1].ops.length - 1].seq!)) {
+      const op = ops[ops.length - 1];
+      // Sequence order picks the original, not which concurrent bytes survive.
+      // Preserve every distinct maximal live variant before acknowledging joined
+      // knowledge. A concurrent tombstone cannot discard another maximal blob.
+      const hashes = new Set([op.blobHash]);
+      if (this.canSync(path)) {
+        for (const other of ops) {
+          const hash = other.blobHash;
+          if (hash === null || hashes.has(hash)) continue;
+          hashes.add(hash);
+          if (await this.hashLocalPath(path) !== hash) {
+            await this.preserveConflict(path, hash, () => this.remoteBytes(ctx, path, hash), progress);
+          }
+        }
+      }
+      const tip = await this.applyRemote(ctx, op, path, progress, true, vv);
+      if (tip) {
+        // Publish a causal join only after its concurrent contents are real files.
+        if (ops.length > 1) tip.pending = true;
+        reconciled[path] = tip;
+      }
+    }
+    if (pathError) throw pathError;
+    if (policy !== this.applicationPolicy) throw new CatchUpNeeded("Sync settings changed during metadata recovery");
+    const hash = await pathTipsHash(reconciled);
+    ctx.assertCurrent();
+    const live = this.io.getData();
+    live.pathTips = reconciled;
+    live.localCursor = cursor;
+    live.lastHlc = clock;
+    live.relayState = { cursor, context: ctx.scope, policy, tips, pathTipsHash: hash };
+    await this.checkpoint();
+    this.status.note(`Relay metadata verified — ${cursor} operations accounted for`);
+  }
+
+  private async decodePath(ctx: OpCtx, op: SignedOp): Promise<string> {
+    ctx.assertCurrent();
+    let path: string;
+    try {
+      path = fromUtf8(await open(ctx.secret, op.pathCipherB64, ctx.vaultId));
+    } catch {
+      throw new Error(`Could not decrypt relay path at operation ${op.seq}`);
+    }
+    ctx.assertCurrent();
+    if (!isSyncPath(path)) throw new Error(`Unsafe relay path at operation ${op.seq}`);
+    return path;
+  }
+
+  private observeHlc(remote: string, deviceId: string): void {
+    const data = this.io.getData();
+    data.lastHlc = packHlc(recvHlc(data.lastHlc ? parseHlc(data.lastHlc) : null, parseHlc(remote), deviceId));
+  }
+
+  private pathTip(path: string): PathTip | null {
+    const tips = this.io.getData().pathTips;
+    return Object.prototype.hasOwnProperty.call(tips, path) ? tips[path] : null;
+  }
+
+  private setPathTip(path: string, tip: PathTip): void {
+    this.assertRunContext();
+    Object.defineProperty(this.io.getData().pathTips, path, {
+      value: tip, enumerable: true, writable: true, configurable: true,
+    });
+  }
+
+  private get applicationPolicy(): string {
+    return JSON.stringify([this.configDir, this.io.getData().ignorePatterns]);
+  }
+
+  private canSync(path: string): boolean {
+    return !this.shouldIgnore(path) && (!this.isConfigPath(path) || isConfigPathAllowed(path, this.configDir));
+  }
+
+  private async applyRemote(
+    ctx: OpCtx, op: SignedOp, path: string, progress: SyncProgress,
+    recovery: boolean, knowledge = op.versionVector
+  ): Promise<PathTip | null> {
+    if (!this.canSync(path)) return null;
+    const tip = this.pathTip(path);
+    // Rebuild causal knowledge from this verified log, not possibly corrupt
+    // tips (or tips belonging to a different relay/vault/identity context).
+    const vv = mergeVv(recovery ? undefined : tip?.vv, knowledge);
+    let localHash = await this.hashLocalPath(path);
+    let pending = false;
+    if (!recovery && tip && ((tip.hash === op.blobHash && covers(tip.vv, op.versionVector)) ||
+      dominates(tip.vv, op.versionVector))) {
+      // Equal vectors are not concurrent. In particular, self echoes must not
+      // replace newer local bytes or manufacture another conflict on each retry.
+      const known = { ...tip, ...(tip.hash !== op.blobHash ? { pending: true } : {}) };
+      this.setPathTip(path, known);
+      progress.applied++;
+      return known;
+    }
+    if (localHash !== op.blobHash) {
+      const unchanged = !recovery && !!tip && !tip.pending && tip.hash === localHash &&
+        dominates(op.versionVector, tip.vv);
+      if (op.blobHash === null) {
+        if (unchanged) {
+          await this.withWatchSuppressed(() => this.deleteLocalPath(path, localHash));
+        } else {
+          // No tombstone is permission to erase divergent or untracked bytes.
+          pending = true;
+          this.pendingLocal.add(path);
+        }
+      } else {
+        const bytes = await this.remoteBytes(ctx, path, op.blobHash);
+        // Network/crypto awaits may have allowed a local edit. Decide using the
+        // current bytes, not the snapshot from before fetching the blob.
+        localHash = await this.hashLocalPath(path);
+        const stillUnchanged = !recovery && !!tip && !tip.pending && tip.hash === localHash &&
+          dominates(op.versionVector, tip.vv);
+        const newPath = localHash === null && !this.explicitDeletes.has(path) &&
+          (recovery || !tip || (tip.hash === null && !tip.pending));
+        if (localHash === op.blobHash) {
+          // Already materialized by a prior, interrupted application.
+        } else if (stillUnchanged || newPath) {
+          await this.withWatchSuppressed(() => this.writeLocalBytes(path, bytes, localHash));
+        } else if (op.deviceId === ctx.deviceId && !recovery) {
+          // A lost push receipt is our own history, not a second user's conflict.
+          pending = true;
+        } else {
+          await this.preserveConflict(path, op.blobHash, bytes, progress);
+          pending = true;
+        }
+      }
+    }
+    const result: PathTip = { hash: op.blobHash, vv, ...(pending ? { pending: true } : {}) };
+    this.setPathTip(path, result);
+    progress.applied++;
+    return result;
+  }
+
+  private async remoteBytes(ctx: OpCtx, path: string, hash: string): Promise<Uint8Array> {
+    let bytes: Uint8Array;
+    try {
+      const packed = await ctx.relay.getBlob(ctx.vaultId, hash);
+      const key = await hkdf(ctx.secret, `blob:${hash}`, 32);
+      bytes = await open(key, bytesToB64(new Uint8Array(packed)));
+    } catch (error) {
+      ctx.assertCurrent();
+      throw new Error(`Could not fetch/decrypt blob for ${path}: ${error instanceof Error ? error.message : error}`);
+    }
+    if (await sha256Hex(bytes) !== hash) throw new Error(`Checksum mismatch for ${path}`);
+    ctx.assertCurrent();
+    return bytes;
+  }
+
+  /** Content-addressed names make interrupted recovery/restarts idempotent. Never overwrite a copy. */
+  private async preserveConflict(
+    path: string, hash: string, bytes: Uint8Array | (() => Promise<Uint8Array>), progress: SyncProgress
+  ): Promise<void> {
+    const original = this.isConfigPath(path) ? `Flock conflicts/${path.slice(this.configDir.length + 1)}` : path;
+    const name = basename(original);
+    const dir = dirname(original);
+    const dot = name.lastIndexOf(".");
+    const stem = dot > 0 ? name.slice(0, dot) : name;
+    const ext = dot > 0 ? name.slice(dot) : "";
+    for (let i = 0; i < 100; i++) {
+      const target = `${dir ? dir + "/" : ""}${stem} (conflict ${hash.slice(0, 12)}${i ? ` ${i}` : ""})${ext}`;
+      if (!this.canSync(target)) throw new Error(`Conflict destination is excluded: ${target}`);
+      const kind = await this.localKind(target);
+      if (kind === "folder") continue;
+      const existingHash = await this.hashLocalPath(target);
+      if (existingHash !== null && existingHash !== hash) continue;
+      if (existingHash === null) {
+        const content = typeof bytes === "function" ? await bytes() : bytes;
+        await this.withWatchSuppressed(() => this.writeLocalBytes(target, content, null));
+        progress.conflicts++;
+        this.status.note(`Conflict: ${path} — kept local, saved remote as ${target}`);
+      }
+      this.pendingLocal.add(target);
+      return;
+    }
+    throw new Error(`Could not reserve a conflict file for ${path}`);
+  }
 
   private get configDir(): string {
     return normalizeVaultPath(this.app.vault.configDir || ".obsidian");
@@ -694,17 +880,14 @@ export class FlockSyncEngine {
    * The permanent Worker starts empty. A vault id from the old tunnel 404s.
    * Enroll that same id, then upload local notes from scratch.
    */
-  private async pullOps(vaultId: string, data: PluginData) {
+  private async pullOps(ctx: OpCtx, after: number): Promise<OpsPullResponse> {
     try {
-      return await this.relay.opsPull(vaultId, data.localCursor);
+      return await ctx.relay.opsPull(ctx.vaultId, after);
     } catch (e) {
       if (!this.isMissingVault(e)) throw e;
-      await this.enrollCurrentVault(vaultId);
-      data.localCursor = 0;
-      data.pathTips = {};
-      data.lastHlc = null;
-      this.status.note("Linked this vault on the relay — uploading local notes");
-      return await this.relay.opsPull(vaultId, 0);
+      await this.enrollCurrentVault(ctx);
+      this.status.note("Linked this vault on the relay — rebuilding metadata");
+      return await ctx.relay.opsPull(ctx.vaultId, after);
     }
   }
 
@@ -712,15 +895,13 @@ export class FlockSyncEngine {
     return e instanceof RelayError && e.status === 404 && /vault not found/i.test(e.message);
   }
 
-  private async enrollCurrentVault(vaultId: string): Promise<void> {
-    const secret = this.identity.flockSecret;
-    if (!secret) throw new Error("Pair a device first");
-    const sealedMetaB64 = await sealJson(secret, {
+  private async enrollCurrentVault(ctx: OpCtx): Promise<void> {
+    const sealedMetaB64 = await sealJson(ctx.secret, {
       name: this.app.vault.getName(),
       createdAt: Date.now(),
     });
     try {
-      await this.relay.vaultEnroll({ vaultId, sealedMetaB64 });
+      await ctx.relay.vaultEnroll({ vaultId: ctx.vaultId, sealedMetaB64 });
     } catch (e) {
       if (e instanceof RelayError && (e.status === 401 || e.code === "unauthorized")) {
         throw new Error(
@@ -731,13 +912,39 @@ export class FlockSyncEngine {
     }
   }
 
-  private opCtx(): OpCtx | null {
+  private async opCtx(): Promise<OpCtx | null> {
     const data = this.io.getData();
     const secret = this.identity.flockSecret;
     const deviceId = this.identity.deviceId;
     const keys = this.identity.keys;
     if (!secret || !deviceId || !keys || !data.vaultId) return null;
-    return { vaultId: data.vaultId, secret, deviceId, ecdsaPriv: keys.ecdsaPriv };
+    const vaultId = data.vaultId;
+    const flockId = this.identity.flockId;
+    const token = this.identity.deviceToken;
+    const relayUrl = data.relayUrl.trim().replace(/\/+$/, "");
+    const relayVersion = this.relay.contextVersion;
+    const capturedSecret = new Uint8Array(secret);
+    const assertCurrent = () => {
+      const live = this.io.getData();
+      const currentSecret = this.identity.flockSecret;
+      if (live.relayUrl.trim().replace(/\/+$/, "") !== relayUrl ||
+        this.relay.baseUrl !== relayUrl || this.relay.contextVersion !== relayVersion ||
+        !live.enrolled || live.vaultId !== vaultId || this.identity.deviceId !== deviceId ||
+        this.identity.flockId !== flockId || this.identity.deviceToken !== token ||
+        this.identity.keys?.ecdsaPriv !== keys.ecdsaPriv || !currentSecret ||
+        currentSecret.length !== capturedSecret.length ||
+        !capturedSecret.every((byte, i) => byte === currentSecret[i])) {
+        throw new ContextChanged("Sync context changed — relay metadata must be verified again");
+      }
+    };
+    assertCurrent();
+    // Persist only a nonsecret scope/fingerprint, never the key or auth token.
+    const scope = JSON.stringify([relayUrl, vaultId, deviceId, flockId, await sha256Hex(capturedSecret)]);
+    assertCurrent();
+    return {
+      vaultId, secret: capturedSecret, deviceId, ecdsaPriv: keys.ecdsaPriv,
+      relay: this.relay.snapshot(assertCurrent), scope, assertCurrent,
+    };
   }
 
   /**
@@ -751,6 +958,7 @@ export class FlockSyncEngine {
     blobHash: string | null,
     prevTip: PathTip | null
   ): Promise<SignedOp> {
+    ctx.assertCurrent();
     const data = this.io.getData();
     const prevHlc = data.lastHlc ? parseHlc(data.lastHlc) : null;
     const hlc = packHlc(tickHlc(prevHlc, ctx.deviceId));
@@ -764,23 +972,8 @@ export class FlockSyncEngine {
       versionVector: bumpVv(prevTip ? prevTip.vv : {}, ctx.deviceId),
     };
     const sigB64 = await signBytes(ctx.ecdsaPriv, canonicalOpMessage(unsigned));
+    ctx.assertCurrent();
     return { ...unsigned, sigB64 };
-  }
-
-  private async localMerkleRoot(
-    secret: Uint8Array,
-    vaultId: string,
-    data: PluginData
-  ): Promise<string> {
-    const tips: Record<string, string | null> = {};
-    for (const [path, tip] of Object.entries(data.pathTips ?? {})) {
-      const cipher = await sealDeterministic(secret, utf8(path), vaultId);
-      tips[cipher] = tip.hash;
-    }
-    const canonical = JSON.stringify(
-      Object.fromEntries(Object.keys(tips).sort().map((k) => [k, tips[k]]))
-    );
-    return sha256Hex(canonical);
   }
 
   private async withWatchSuppressed<T>(fn: () => Promise<T>): Promise<T> {
@@ -792,79 +985,97 @@ export class FlockSyncEngine {
     }
   }
 
-  private async localPathExists(path: string): Promise<boolean> {
+  private async localKind(path: string): Promise<"file" | "folder" | null> {
+    this.assertRunContext();
     if (this.isConfigPath(path)) {
-      try {
-        return await this.app.vault.adapter.exists(path);
-      } catch {
-        return false;
-      }
+      const stat = await this.app.vault.adapter.stat(path);
+      this.assertRunContext();
+      return stat?.type ?? null;
     }
-    return Boolean(this.app.vault.getAbstractFileByPath(path));
+    const file = this.app.vault.getAbstractFileByPath(path);
+    return file instanceof TFile ? "file" : file instanceof TFolder ? "folder" : null;
   }
 
   private async readLocalBytes(path: string): Promise<Uint8Array | null> {
-    try {
-      if (this.isConfigPath(path)) {
-        return new Uint8Array(await this.app.vault.adapter.readBinary(path));
-      }
-      const file = this.app.vault.getAbstractFileByPath(path);
-      if (!(file instanceof TFile)) return null;
-      return new Uint8Array(await this.app.vault.readBinary(file));
-    } catch {
-      return null;
+    this.assertRunContext();
+    if (this.isConfigPath(path)) {
+      const kind = await this.localKind(path);
+      if (kind === null) return null;
+      if (kind !== "file") throw new Error(`Expected a file, found a folder: ${path}`);
+      const bytes = new Uint8Array(await this.app.vault.adapter.readBinary(path));
+      this.assertRunContext();
+      return bytes;
     }
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (file instanceof TFolder) throw new Error(`Expected a file, found a folder: ${path}`);
+    if (!(file instanceof TFile)) return null;
+    const bytes = new Uint8Array(await this.app.vault.readBinary(file));
+    this.assertRunContext();
+    return bytes;
   }
 
-  private async hashLocalPath(path: string): Promise<string | null> {
-    if (!this.isConfigPath(path)) await this.flushOpenEditors(path);
+  private async hashLocalPath(path: string, flush = true): Promise<string | null> {
+    if (flush && !this.isConfigPath(path)) await this.flushOpenEditors(path);
     const bytes = await this.readLocalBytes(path);
-    return bytes ? sha256Hex(bytes) : null;
+    const hash = bytes ? await sha256Hex(bytes) : null;
+    this.assertRunContext();
+    return hash;
   }
 
-  private async writeLocalBytes(path: string, bytes: Uint8Array): Promise<void> {
+  private async writeLocalBytes(path: string, bytes: Uint8Array, expectedHash: string | null): Promise<void> {
+    this.assertRunContext();
+    if (!isSyncPath(path)) throw new Error("Unsafe file write path");
     const ab = toArrayBuffer(bytes);
     if (this.isConfigPath(path)) {
       const dir = dirname(path);
       if (dir) await this.ensureAdapterFolder(dir);
+      if (await this.hashLocalPath(path) !== expectedHash) throw new CatchUpNeeded(`Local file changed during sync: ${path}`);
+      this.assertRunContext();
       await this.app.vault.adapter.writeBinary(path, ab);
+      this.assertRunContext();
       return;
     }
     const folder = dirname(path);
     if (folder) await this.ensureLocalFolder(folder);
+    if (await this.hashLocalPath(path) !== expectedHash) throw new CatchUpNeeded(`Local file changed during sync: ${path}`);
+    this.assertRunContext();
     const existing = this.app.vault.getAbstractFileByPath(path);
     if (existing instanceof TFile) {
       await this.app.vault.modifyBinary(existing, ab);
     } else {
       await this.app.vault.createBinary(normalizePath(path), ab);
     }
+    this.assertRunContext();
     this.reloadOpenViews(path);
   }
 
-  private async deleteLocalPath(path: string): Promise<void> {
-    this.configStatCache.delete(path);
-    try {
-      if (this.isConfigPath(path)) {
-        await this.app.vault.adapter.remove(path);
-        return;
-      }
-      const file = this.app.vault.getAbstractFileByPath(path);
-      if (file) await this.app.vault.delete(file);
-    } catch {
-      /* already gone */
+  private async deleteLocalPath(path: string, expectedHash: string | null): Promise<void> {
+    this.assertRunContext();
+    if (!isSyncPath(path)) throw new Error("Unsafe file delete path");
+    if (await this.hashLocalPath(path) !== expectedHash) throw new CatchUpNeeded(`Local file changed during sync: ${path}`);
+    if (this.isConfigPath(path)) {
+      if (await this.localKind(path) === "file") await this.app.vault.adapter.remove(path);
+      this.assertRunContext();
+      return;
     }
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (file instanceof TFolder) throw new Error(`Refusing to delete a folder: ${path}`);
+    if (file instanceof TFile) await this.app.vault.delete(file);
+    this.assertRunContext();
   }
 
   private async ensureLocalFolder(folderPath: string): Promise<void> {
     const normalized = normalizePath(folderPath);
-    const existing = this.app.vault.getAbstractFileByPath(normalized);
-    if (existing) return;
     const parts = normalized.split("/").filter(Boolean);
     let cur = "";
     for (const part of parts) {
+      this.assertRunContext();
       cur = cur ? `${cur}/${part}` : part;
-      if (!this.app.vault.getAbstractFileByPath(cur)) {
+      const existing = this.app.vault.getAbstractFileByPath(cur);
+      if (existing instanceof TFile) throw new Error(`Expected a folder, found a file: ${cur}`);
+      if (!existing) {
         await this.app.vault.createFolder(cur);
+        this.assertRunContext();
       }
     }
   }
@@ -873,122 +1084,194 @@ export class FlockSyncEngine {
     const parts = normalizeVaultPath(dir).split("/").filter(Boolean);
     let cur = "";
     for (const part of parts) {
+      this.assertRunContext();
       cur = cur ? `${cur}/${part}` : part;
-      try {
-        if (await this.app.vault.adapter.exists(cur)) continue;
-      } catch {
-        /* ignore */
-      }
-      try {
-        await this.app.vault.adapter.mkdir(cur);
-      } catch {
-        /* already exists */
-      }
+      const stat = await this.app.vault.adapter.stat(cur);
+      this.assertRunContext();
+      if (stat?.type === "file") throw new Error(`Expected a folder, found a file: ${cur}`);
+      if (!stat) await this.app.vault.adapter.mkdir(cur);
+      this.assertRunContext();
     }
   }
 
   // ------------------------------------------------------------ scan passes
 
-  /**
-   * Config files never raise vault events, so every sync scans the config
-   * dir. stat mtime/size caching keeps this cheap after the first pass.
-   */
-  private async scanConfigChanges(data: PluginData): Promise<void> {
-    const cd = this.configDir;
-    let paths: string[];
-    try {
-      paths = await listConfigRelPaths(this.app);
-    } catch {
-      return;
-    }
-    const listed = new Set(paths);
-    for (const path of paths) {
-      if (this.shouldIgnore(path)) continue;
-      const tip: PathTip | null = data.pathTips[path] ?? null;
-      let st: { mtime: number; size: number } | null = null;
-      try {
-        st = await this.app.vault.adapter.stat(path);
-      } catch {
-        st = null;
+  /** Unlike a best-effort settings listing, an unreadable directory is not proof of deletion. */
+  private async listConfigFiles(): Promise<string[]> {
+    this.assertRunContext();
+    const adapter = this.app.vault.adapter;
+    const root = await adapter.stat(this.configDir);
+    this.assertRunContext();
+    if (!root) return [];
+    if (root.type !== "folder") throw new Error("Obsidian config directory is not a folder");
+    const files: string[] = [];
+    const queue = [this.configDir];
+    const seen = new Set(queue);
+    while (queue.length) {
+      const listing = await adapter.list(queue.shift()!);
+      this.assertRunContext();
+      for (const path of listing.files) {
+        if (isConfigPathAllowed(path, this.configDir) && !this.shouldIgnore(path)) files.push(path);
       }
-      if (!st) {
-        if (tip && tip.hash !== null) this.pendingDeletes.add(path);
-        this.configStatCache.delete(path);
+      for (const path of listing.folders) {
+        if (!seen.has(path) && isConfigPathAllowed(`${path}/_`, this.configDir) && !this.shouldIgnore(path)) {
+          seen.add(path);
+          queue.push(path);
+        }
+      }
+    }
+    return files;
+  }
+
+  /** Hash tracked files too: an edit while the plugin was closed has no watch event. */
+  private async scanLocalChanges(): Promise<void> {
+    this.assertRunContext();
+    for (const { oldPath, newPath } of this.pendingRenames.splice(0)) {
+      if (this.canSync(oldPath)) this.pendingDeletes.add(oldPath);
+      if (this.canSync(newPath)) this.pendingLocal.add(newPath);
+    }
+    const paths = new Set([
+      ...this.app.vault.getFiles().map((file) => file.path),
+      ...await this.listConfigFiles(),
+      ...Object.keys(this.io.getData().pathTips),
+      ...this.pendingLocal, ...this.pendingDeletes,
+    ]);
+    for (const path of paths) {
+      if (!this.canSync(path)) {
+        this.pendingLocal.delete(path);
+        this.pendingDeletes.delete(path);
         continue;
       }
-      const cached = this.configStatCache.get(path);
-      if (cached && cached.mtime === st.mtime && cached.size === st.size) continue;
+      if (!isSyncPath(path)) throw new Error(`Unsafe local sync path: ${path}`);
+      if (!this.isConfigPath(path)) await this.flushOpenEditors(path);
+      const revision = this.pathRevisions.get(path) ?? 0;
+      const tip = this.pathTip(path);
+      // Config has no watch events and adapters can preserve mtime/size. Only a
+      // fresh content hash can certify that it still matches acknowledged bytes.
+      const hash = await this.hashLocalPath(path, false);
+      if ((this.pathRevisions.get(path) ?? 0) !== revision) {
+        this.pendingLocal.add(path);
+        continue;
+      }
+      if (hash === null) {
+        this.pendingLocal.delete(path);
+        if (tip && (tip.hash !== null || tip.pending)) this.pendingDeletes.add(path);
+        else this.pendingDeletes.delete(path);
+      } else {
+        this.pendingDeletes.delete(path);
+        if (!tip || tip.hash !== hash || tip.pending) this.pendingLocal.add(path);
+        else this.pendingLocal.delete(path);
+      }
+    }
+  }
+
+  private async pushLocalChanges(ctx: OpCtx, progress: SyncProgress): Promise<void> {
+    ctx.assertCurrent();
+    const prepared: PreparedOp[] = [];
+    for (const path of [...this.pendingDeletes]) {
+      const revision = this.pathRevisions.get(path) ?? 0;
+      const tip = this.pathTip(path);
+      if (!this.canSync(path) || !tip || (tip.hash === null && !tip.pending)) {
+        this.pendingDeletes.delete(path);
+        continue;
+      }
+      if (await this.localKind(path) !== null) {
+        this.pendingLocal.add(path);
+        this.pendingDeletes.delete(path);
+        continue;
+      }
+      prepared.push({ path, op: await this.makeOp(ctx, path, null, tip), revision });
+    }
+    for (const path of [...this.pendingLocal]) {
+      if (!this.canSync(path)) { this.pendingLocal.delete(path); continue; }
+      if (!this.isConfigPath(path)) await this.flushOpenEditors(path);
+      const revision = this.pathRevisions.get(path) ?? 0;
+      const tip = this.pathTip(path);
       const bytes = await this.readLocalBytes(path);
-      if (!bytes) continue;
+      if (bytes === null) {
+        if (tip && tip.hash !== null) this.pendingDeletes.add(path);
+        if ((this.pathRevisions.get(path) ?? 0) === revision) this.pendingLocal.delete(path);
+        continue;
+      }
       const hash = await sha256Hex(bytes);
-      this.configStatCache.set(path, { mtime: st.mtime, size: st.size });
-      if (!tip || tip.hash !== hash) this.pendingLocal.add(path);
+      if (tip?.hash === hash && !tip.pending) {
+        if ((this.pathRevisions.get(path) ?? 0) === revision) this.pendingLocal.delete(path);
+        continue;
+      }
+      if (bytes.byteLength > MAX_BLOB_BYTES) {
+        throw new Error(`${path} is over the ${Math.round(MAX_BLOB_BYTES / (1024 * 1024))} MB sync limit`);
+      }
+      const key = await hkdf(ctx.secret, `blob:${hash}`, 32);
+      const sealed = await seal(key, bytes);
+      await ctx.relay.putBlob(ctx.vaultId, hash, toArrayBuffer(b64ToBytes(sealed)));
+      prepared.push({ path, op: await this.makeOp(ctx, path, hash, tip), revision });
     }
-    // Tips for config paths no longer on disk → deletions to push.
-    for (const path of Object.keys(data.pathTips)) {
-      if (!this.isConfigPath(path) || !isConfigPathAllowed(path, cd)) continue;
-      if (listed.has(path)) continue;
-      const tip = data.pathTips[path];
-      if (tip && tip.hash !== null) this.pendingDeletes.add(path);
-      this.configStatCache.delete(path);
+    if (!prepared.length) return;
+    // No path tip or pending work is advanced for a blob upload alone. Persist
+    // the clock/merged knowledge so failures and a restart can safely retry.
+    await this.checkpoint();
+    const before = this.io.getData().localCursor;
+    const receipt = await ctx.relay.opsPush(ctx.vaultId, { ops: prepared.map(({ op }) => op) });
+    validateHead(receipt.head);
+    if (!Array.isArray(receipt.ops) || receipt.ops.length !== prepared.length) throw new Error("Incomplete push acknowledgment");
+    let seq = before;
+    for (let i = 0; i < prepared.length; i++) {
+      const accepted = receipt.ops[i];
+      const sent = prepared[i].op;
+      if (!Number.isSafeInteger(accepted.seq) || accepted.seq! <= seq || accepted.seq! > receipt.head ||
+        accepted.sigB64 !== sent.sigB64 ||
+        bytesToB64(canonicalOpMessage(accepted)) !== bytesToB64(canonicalOpMessage(sent))) {
+        throw new Error("Invalid push acknowledgment");
+      }
+      seq = accepted.seq!;
     }
-  }
-
-  /** Files with no tip (or a tombstone) — first upload and join-existing-vault. */
-  private scanNewLocalFiles(data: PluginData): void {
-    for (const f of this.app.vault.getFiles()) {
-      const p = normalizeVaultPath(f.path);
-      if (this.isConfigPath(p)) continue;
-      if (this.shouldIgnore(p)) continue;
-      if (shouldEnqueueLocalPath(data.pathTips[p])) this.pendingLocal.add(p);
+    for (const { path, op, revision } of prepared) {
+      const tip = this.pathTip(path);
+      this.setPathTip(path, {
+        hash: op.blobHash, vv: mergeVv(tip?.vv, op.versionVector),
+        ...(!covers(op.versionVector, tip?.vv ?? {}) ? { pending: true } : {}),
+      });
+      if ((this.pathRevisions.get(path) ?? 0) === revision) {
+        this.pendingLocal.delete(path);
+        this.pendingDeletes.delete(path);
+        this.explicitDeletes.delete(path);
+      }
     }
-  }
-
-  /** Cheap existence check per tip — catches deletes made while offline. */
-  private scanMissingFiles(data: PluginData): void {
-    for (const path of Object.keys(data.pathTips)) {
-      if (this.isConfigPath(path)) continue; // config scan handles these
-      if (this.shouldIgnore(path)) continue;
-      if (this.pendingLocal.has(path) || this.pendingDeletes.has(path)) continue;
-      const tip = data.pathTips[path];
-      if (!tip || tip.hash === null) continue;
-      if (!this.app.vault.getAbstractFileByPath(path)) this.pendingDeletes.add(path);
-    }
+    progress.pushed += prepared.length;
+    await this.checkpoint();
+    // The receipt may include unread peer ops between our last pull and push.
+    await this.drainPull(ctx, progress, receipt.head);
   }
 
   // ------------------------------------------------- editor flush / reload
 
-  /**
-   * Ask open editors (esp. Canvas) to flush pending in-memory edits to disk
-   * before we read/hash/upload the file. Pattern copied from the old
-   * sync-engine.ts (no Drive client involved).
-   */
+  /** TextFileView.save is the persistence barrier; requestSave is only a debounce. */
   private async flushOpenEditors(path: string): Promise<void> {
+    const ctx = this.activeContext;
+    ctx?.assertCurrent();
     const target = normalizeVaultPath(path);
-    let flushed = false;
+    const views: Array<{ save?: () => Promise<void> }> = [];
     this.app.workspace.iterateAllLeaves((leaf) => {
       const view = leaf.view as {
         file?: TFile;
         requestSave?: () => void;
-        save?: () => void | Promise<void>;
+        save?: () => Promise<void>;
       };
       const file = view.file;
       if (!file || normalizeVaultPath(file.path) !== target) return;
-      try {
-        if (typeof view.requestSave === "function") {
-          view.requestSave();
-          flushed = true;
-        } else if (typeof view.save === "function") {
-          void view.save();
-          flushed = true;
-        }
-      } catch {
-        /* ignore editor-specific save failures */
-      }
+      if (typeof view.save === "function" || typeof view.requestSave === "function") views.push(view);
     });
-    if (flushed && target.toLowerCase().endsWith(".canvas")) {
-      await sleep(150);
-    }
+    const results = await Promise.allSettled(views.map(async (view) => {
+      ctx?.assertCurrent();
+      if (!view.save) throw new Error(`Cannot safely save the open editor for ${path}`);
+      const saved = view.save();
+      if (!saved || typeof saved.then !== "function") throw new Error(`Editor save is not awaitable for ${path}`);
+      await saved;
+      ctx?.assertCurrent();
+    }));
+    const failed = results.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
+    ctx?.assertCurrent();
   }
 
   /** Rebuild open canvas leaves for a path so pulled content shows up. */
@@ -1012,14 +1295,27 @@ export class FlockSyncEngine {
 
 // ------------------------------------------------------------------ helpers
 
+/** Keep the version-vector antichain; equal-vector retries of equal bytes dedupe. */
+function retainMaximal(versions: SignedOp[], incoming: SignedOp): SignedOp[] {
+  if (versions.some((op) => dominates(op.versionVector, incoming.versionVector))) return versions;
+  return [...versions.filter((op) =>
+    !dominates(incoming.versionVector, op.versionVector) &&
+    !(op.blobHash === incoming.blobHash && covers(op.versionVector, incoming.versionVector) &&
+      covers(incoming.versionVector, op.versionVector))), incoming];
+}
+
 /** Element-wise max of two version vectors. */
 function mergeVv(
   a?: Record<string, number>,
   b?: Record<string, number>
 ): Record<string, number> {
-  const out: Record<string, number> = {};
+  const out: Record<string, number> = Object.create(null);
   const keys = new Set([...Object.keys(a ?? {}), ...Object.keys(b ?? {})]);
-  for (const k of keys) out[k] = Math.max(a?.[k] ?? 0, b?.[k] ?? 0);
+  for (const k of keys) {
+    const av = a && Object.prototype.hasOwnProperty.call(a, k) ? a[k] : 0;
+    const bv = b && Object.prototype.hasOwnProperty.call(b, k) ? b[k] : 0;
+    out[k] = Math.max(av, bv);
+  }
   return out;
 }
 
@@ -1027,10 +1323,6 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   const out = new ArrayBuffer(bytes.byteLength);
   new Uint8Array(out).set(bytes);
   return out;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 async function decodeVaultName(secret: Uint8Array, sealedMetaB64: string): Promise<string | null> {

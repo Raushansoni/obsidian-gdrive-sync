@@ -1,4 +1,5 @@
 import { DEFAULT_RELAY_URL, isEphemeralRelayUrl } from "./flock-url";
+import { isHash, isHlc, isSyncPath, isVersionVector } from "./sync/relay-state";
 
 export interface StatusLogEntry {
   t: number;
@@ -8,6 +9,20 @@ export interface StatusLogEntry {
 export interface PathTip {
   hash: string | null;
   vv: Record<string, number>;
+  /** Incoming knowledge retained with local bytes; publish even if the hash is unchanged. */
+  pending?: boolean;
+}
+
+export interface RelayState {
+  cursor: number;
+  /** Nonsecret relay/vault/device/flock/key-fingerprint scope for this projection. */
+  context: string;
+  /** A changed application filter needs reconciliation, not a different wire root. */
+  policy: string;
+  /** Complete wire projection, including excluded paths and null tombstones. */
+  tips: Record<string, string | null>;
+  /** Detect missing/corrupt application metadata even at an unchanged relay head. */
+  pathTipsHash: string;
 }
 
 export interface PluginData {
@@ -22,6 +37,7 @@ export interface PluginData {
   statusLog: StatusLogEntry[];
   localCursor: number;
   pathTips: Record<string, PathTip>;
+  relayState: RelayState | null;
   lastHlc: string | null;
 }
 
@@ -51,6 +67,7 @@ export const DEFAULT_DATA: PluginData = {
   statusLog: [],
   localCursor: 0,
   pathTips: {},
+  relayState: null,
   lastHlc: null,
 };
 
@@ -75,11 +92,46 @@ function canonicalRelayUrl(raw: string): string {
   return url;
 }
 
+function isCursor(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function readPathTips(raw: unknown): Record<string, PathTip> | null {
+  if (!isRecord(raw)) return null;
+  const entries: Array<[string, PathTip]> = [];
+  for (const [path, tip] of Object.entries(raw)) {
+    if (!isSyncPath(path) || !isRecord(tip) ||
+      !(tip.hash === null || isHash(tip.hash)) || !isVersionVector(tip.vv) ||
+      (tip.pending !== undefined && typeof tip.pending !== "boolean")) return null;
+    entries.push([path, {
+      hash: tip.hash,
+      vv: { ...tip.vv },
+      ...(tip.pending === true ? { pending: true } : {}),
+    }]);
+  }
+  return Object.fromEntries(entries);
+}
+
+function readRelayState(raw: unknown, cursor: number): RelayState | null {
+  if (!isRecord(raw) || raw.cursor !== cursor || !isCursor(raw.cursor) ||
+    typeof raw.context !== "string" || !raw.context || typeof raw.policy !== "string" ||
+    !isRecord(raw.tips) || !isHash(raw.pathTipsHash)) return null;
+  const entries: Array<[string, string | null]> = [];
+  for (const [cipher, hash] of Object.entries(raw.tips)) {
+    if (!cipher || !(hash === null || isHash(hash))) return null;
+    entries.push([cipher, hash]);
+  }
+  return { cursor, context: raw.context, policy: raw.policy, tips: Object.fromEntries(entries), pathTipsHash: raw.pathTipsHash };
+}
+
 /** Drop Drive-era fields so they never persist again after a Flock save. */
 export function sanitizePluginData(raw: unknown): PluginData {
   const r = isRecord(raw) ? raw : {};
   const legacy = looksLikeLegacyDrive(r);
   const interval = Number(r.syncIntervalSeconds);
+  const validCursor = isCursor(r.localCursor);
+  const pathTips = readPathTips(r.pathTips);
+  const localCursor = legacy || !validCursor ? 0 : r.localCursor as number;
   return {
     relayUrl: canonicalRelayUrl(typeof r.relayUrl === "string" ? r.relayUrl : ""),
     vaultId: legacy ? null : typeof r.vaultId === "string" ? r.vaultId : null,
@@ -96,8 +148,9 @@ export function sanitizePluginData(raw: unknown): PluginData {
             (e) => e && typeof e.t === "number" && typeof e.msg === "string"
           )
         : [],
-    localCursor: legacy ? 0 : typeof r.localCursor === "number" ? r.localCursor : 0,
-    pathTips: legacy ? {} : isRecord(r.pathTips) ? (r.pathTips as Record<string, PathTip>) : {},
-    lastHlc: legacy ? null : typeof r.lastHlc === "string" ? r.lastHlc : null,
+    localCursor,
+    pathTips: legacy ? {} : pathTips ?? {},
+    relayState: legacy || !validCursor || !pathTips ? null : readRelayState(r.relayState, localCursor),
+    lastHlc: legacy || !isHlc(r.lastHlc) ? null : r.lastHlc,
   };
 }

@@ -49,18 +49,35 @@ export class RelayHttp {
   private base: string;
   private deviceId: string | null = null;
   private token: string | null = null;
+  private revision = 0;
+  private assertCurrent: (() => void) | null = null;
 
   constructor(baseUrl: string) {
     this.base = stripTrailingSlash(baseUrl);
   }
 
   setBase(url: string): void {
-    this.base = stripTrailingSlash(url);
+    const base = stripTrailingSlash(url);
+    if (this.base !== base) this.revision++;
+    this.base = base;
   }
 
   setAuth(deviceId: string, token: string): void {
+    if (this.deviceId !== deviceId || this.token !== token) this.revision++;
     this.deviceId = deviceId;
     this.token = token;
+  }
+
+  get baseUrl(): string { return this.base; }
+  get contextVersion(): number { return this.revision; }
+
+  /** Pin transport/auth for one run, but reject requests and receipts after a context switch. */
+  snapshot(assertCurrent: () => void): RelayHttp {
+    const client = new RelayHttp(this.base);
+    client.deviceId = this.deviceId;
+    client.token = this.token;
+    client.assertCurrent = assertCurrent;
+    return client;
   }
 
   // ---------------------------------------------------------------- internals
@@ -78,6 +95,7 @@ export class RelayHttp {
     body?: unknown,
     extraHeaders?: Record<string, string>
   ): Promise<RequestUrlResponse> {
+    this.assertCurrent?.();
     const headers: Record<string, string> = { ...this.authHeaders(), ...(extraHeaders ?? {}) };
     let wireBody: string | ArrayBuffer | undefined;
     if (body !== undefined) {
@@ -100,8 +118,10 @@ export class RelayHttp {
         throw: false,
       });
     } catch (e) {
+      this.assertCurrent?.();
       throw new RelayError(0, explainRelayNetworkError(e, this.base, Platform.isMobile));
     }
+    this.assertCurrent?.();
     if (res.status >= 400) throw this.toError(res);
     return res;
   }
@@ -212,9 +232,9 @@ export class RelayHttp {
 
   // -------------------------------------------------------------- vault log
 
-  async opsPush(vaultId: string, req: OpsPushRequest): Promise<{ head?: number }> {
+  async opsPush(vaultId: string, req: OpsPushRequest): Promise<OpsPullResponse> {
     const res = await this.send("POST", `/v1/vaults/${encodeURIComponent(vaultId)}/ops`, req);
-    return this.parseJson<{ head?: number }>(res) ?? {};
+    return this.expectJson<OpsPullResponse>(res);
   }
 
   async opsPull(vaultId: string, after: number): Promise<OpsPullResponse> {
