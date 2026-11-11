@@ -245,6 +245,16 @@ export class RelayHttp {
     return this.expectJson<OpsPullResponse>(res);
   }
 
+  /** Wait briefly for a changed head. Pull the authenticated ops separately. */
+  async waitForHead(vaultId: string, after: number): Promise<number> {
+    const res = await this.send("GET", `/v1/vaults/${encodeURIComponent(vaultId)}/wait?after=${after}`);
+    const { head } = this.expectJson<{ head?: unknown }>(res);
+    if (typeof head !== "number" || !Number.isSafeInteger(head) || head < 0) {
+      throw new RelayError(res.status, "Malformed relay head notification");
+    }
+    return head;
+  }
+
   async merkle(vaultId: string): Promise<MerkleResponse> {
     const res = await this.send("GET", `/v1/vaults/${encodeURIComponent(vaultId)}/merkle`);
     return this.expectJson<MerkleResponse>(res);

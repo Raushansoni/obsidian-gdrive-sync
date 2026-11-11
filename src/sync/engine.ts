@@ -19,6 +19,7 @@ import { sha256Hex } from "../util/hash";
 import { basename, dirname, normalizeVaultPath } from "../util/paths";
 import { isIgnored, parseIgnorePatterns } from "./ignore";
 import { isConfigPathAllowed } from "./config-dir";
+import { mergeContent } from "./content-merge";
 import { covers, isHash, isSyncPath, pathTipsHash, relayRoot, validateHead, validatePull } from "./relay-state";
 import {
   namesMatch,
@@ -33,6 +34,7 @@ import type { VaultListItem } from "../protocol";
 const WATCH_DEBOUNCE_MS = 1200;
 const QUEUED_RERUN_MS = 250;
 const MAX_CATCH_UP_PASSES = 3;
+const FULL_SCAN_INTERVAL_MS = 5 * 60 * 1000;
 
 interface OpCtx {
   vaultId: string;
@@ -60,6 +62,7 @@ interface PreparedOp {
 class CatchUpNeeded extends Error {}
 class RebuildNeeded extends Error {}
 class ContextChanged extends Error {}
+class MissingBlob extends Error {}
 
 /**
  * FlockSyncEngine — end-to-end encrypted vault sync over the Flock relay.
@@ -70,10 +73,8 @@ class ContextChanged extends Error {}
  * plaintext's sha256 (`blob:<hash>`), so identical content dedupes on the
  * relay and integrity is verifiable after decryption.
  *
- * Conflict policy (no last-write-wins): preserve divergent/untracked local
- * bytes, retain differing incoming bytes as a real conflict file, then publish
- * merged causal knowledge. Only a dominating op over unchanged tracked bytes
- * may overwrite or delete them. Recovery reconciles latest state, not history.
+ * Merge supported content from a known common base. Preserve both versions
+ * when their edits cannot be merged, then publish joined causal knowledge.
  *
  * Note on `document.hidden`: sync() never early-returns for hidden windows —
  * mobile/background sync relies on the plugin calling sync() on
@@ -90,14 +91,14 @@ export class FlockSyncEngine {
   /** One in-flight sync; extra triggers queue exactly one rerun (old engine pattern). */
   private running = false;
   private queued = false;
+  private queuedFullScan = false;
+  private lastFullScanAt: number | null = null;
+  private lastConfigScanAt: number | null = null;
+  private verifiedHead: { scope: string; cursor: number; state: string } | null = null;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
-  /**
-   * Watch suppression is a COUNTER, not a boolean: remote writes can nest
-   * (tombstone delete while a conflict copy is written), and a boolean would
-   * un-suppress on the innermost finally while an outer write is still going.
-   */
-  private suppressWatchDepth = 0;
+  private deletingRemotePaths = new Set<string>();
+  private pendingCanvasReloads = new Set<string>();
 
   private pendingLocal = new Set<string>();
   private pendingDeletes = new Set<string>();
@@ -133,7 +134,6 @@ export class FlockSyncEngine {
   // ------------------------------------------------------------------ watch
 
   onLocalCreateOrModify(file: TAbstractFile): void {
-    if (this.suppressWatchDepth > 0) return;
     if (!(file instanceof TFile)) return;
     const path = normalizeVaultPath(file.path);
     if (this.isConfigPath(path)) return; // config files are scanned, not evented
@@ -146,8 +146,8 @@ export class FlockSyncEngine {
   }
 
   onLocalDelete(file: TAbstractFile): void {
-    if (this.suppressWatchDepth > 0) return;
     const path = normalizeVaultPath(file.path);
+    if (this.deletingRemotePaths.has(path)) return;
     if (this.isConfigPath(path)) return;
     if (this.shouldIgnore(path)) return;
     if (file instanceof TFolder) {
@@ -169,7 +169,6 @@ export class FlockSyncEngine {
   }
 
   onLocalRename(file: TAbstractFile, oldPath: string): void {
-    if (this.suppressWatchDepth > 0) return;
     const from = normalizeVaultPath(oldPath);
     const to = normalizeVaultPath(file.path);
     if (this.isConfigPath(from) || this.isConfigPath(to)) return;
@@ -211,7 +210,7 @@ export class FlockSyncEngine {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
-      void this.sync();
+      void this.sync({ full: false });
     }, delayMs);
   }
 
@@ -391,9 +390,10 @@ export class FlockSyncEngine {
 
   // ------------------------------------------------------------------ sync
 
-  async sync(): Promise<void> {
+  async sync({ full = true }: { full?: boolean } = {}): Promise<void> {
     if (this.running) {
       this.queued = true;
+      this.queuedFullScan ||= full;
       return;
     }
     const data = this.io.getData();
@@ -416,6 +416,10 @@ export class FlockSyncEngine {
     this.debounceTimer = null;
     const forceRecovery = this.recoveryRequested;
     this.recoveryRequested = false;
+    const fullScan = full || forceRecovery || this.lastFullScanAt === null ||
+      Date.now() - this.lastFullScanAt >= FULL_SCAN_INTERVAL_MS;
+    const configScan = fullScan || this.lastConfigScanAt === null ||
+      Date.now() - this.lastConfigScanAt >= data.syncIntervalSeconds * 1000;
     const queuedCount =
       this.pendingLocal.size + this.pendingDeletes.size + this.pendingRenames.length;
     this.status.set("syncing", "Syncing…", queuedCount);
@@ -429,7 +433,7 @@ export class FlockSyncEngine {
       if (!ctx) throw new Error("Missing device identity");
       this.activeContext = ctx;
       ctx.assertCurrent();
-      const sharedId = await this.resolveSharedVaultId(ctx);
+      const sharedId = fullScan ? await this.resolveSharedVaultId(ctx) : ctx.vaultId;
       ctx.assertCurrent();
       if (this.io.getData().vaultId && sharedId !== this.io.getData().vaultId) {
         await this.switchVault(
@@ -439,13 +443,17 @@ export class FlockSyncEngine {
         ctx = this.activeContext!;
       }
       // Verify metadata BEFORE deriving any local deletion from it.
-      await this.ensureVerified(ctx, progress, forceRecovery);
+      await this.ensureVerified(ctx, progress, forceRecovery, fullScan);
+      await this.scanLocalChanges(fullScan || progress.rebuilt, configScan);
       for (let pass = 0; pass < MAX_CATCH_UP_PASSES; pass++) {
-        await this.scanLocalChanges();
+        const pushed = progress.pushed;
+        const rebuilt = progress.rebuilt;
         await this.pushLocalChanges(ctx, progress);
-        await this.ensureVerified(ctx, progress);
-        await this.scanLocalChanges();
+        if (progress.pushed !== pushed) await this.ensureVerified(ctx, progress);
+        await this.scanLocalChanges(!rebuilt && progress.rebuilt);
         if (!this.pendingLocal.size && !this.pendingDeletes.size && !this.pendingRenames.length) {
+          if (this.debounceTimer) clearTimeout(this.debounceTimer);
+          this.debounceTimer = null;
           completed = true;
           break;
         }
@@ -456,7 +464,6 @@ export class FlockSyncEngine {
       }
 
       this.io.getData().lastError = null;
-      await this.checkpoint();
       ctx.assertCurrent();
       if (progress.conflicts > 0) {
         this.status.set(
@@ -472,7 +479,10 @@ export class FlockSyncEngine {
           (progress.conflicts > 0 ? `, ${progress.conflicts} conflict(s)` : "")
       );
       await this.checkpoint();
+      if (fullScan || progress.rebuilt) this.lastFullScanAt = Date.now();
+      if (configScan || progress.rebuilt) this.lastConfigScanAt = Date.now();
     } catch (e) {
+      this.lastFullScanAt = null;
       try { this.activeContext?.assertCurrent(); } catch (changed) { e = changed; }
       if (e instanceof ContextChanged) {
         // Do not save A's projection as verified metadata for B. Keep local
@@ -501,10 +511,12 @@ export class FlockSyncEngine {
       this.activeContext = null;
       this.running = false;
       const rerun = this.queued && (completed || this.recoveryRequested);
+      const rerunFull = this.queuedFullScan;
       this.queued = false;
+      this.queuedFullScan = false;
       if (rerun) {
         setTimeout(() => {
-          void this.sync();
+          void this.sync({ full: rerunFull });
         }, QUEUED_RERUN_MS);
       }
     }
@@ -530,7 +542,7 @@ export class FlockSyncEngine {
     this.activeContext?.assertCurrent();
   }
 
-  private async ensureVerified(ctx: OpCtx, progress: SyncProgress, force = false): Promise<void> {
+  private async ensureVerified(ctx: OpCtx, progress: SyncProgress, force = false, refresh = false): Promise<void> {
     ctx.assertCurrent();
     const data = this.io.getData();
     if (force || !data.relayState || data.relayState.cursor !== data.localCursor ||
@@ -540,14 +552,22 @@ export class FlockSyncEngine {
       await this.rebuildRelayState(ctx, progress);
     }
     for (let pass = 0; pass < MAX_CATCH_UP_PASSES; pass++) {
+      let head: number;
       try {
-        await this.drainPull(ctx, progress);
+        head = await this.drainPull(ctx, progress);
       } catch (error) {
         if (!(error instanceof RebuildNeeded) || progress.rebuilt) throw error;
         await this.rebuildRelayState(ctx, progress);
+        continue;
       }
       const cursor = this.io.getData().localCursor;
-      const root = await relayRoot(this.io.getData().relayState!.tips);
+      const state = this.io.getData().relayState!;
+      if (state.policy !== this.applicationPolicy) {
+        throw new CatchUpNeeded("Sync settings changed - reconciliation is pending");
+      }
+      if (!refresh && head === cursor && this.verifiedHead?.scope === ctx.scope &&
+        this.verifiedHead.cursor === cursor && this.verifiedHead.state === state.pathTipsHash) return;
+      const root = await relayRoot(state.tips);
       // The relay reads rows, awaits hashing, then reads head. Confirm a mismatch
       // before treating it as corruption; a moving head is only catch-up work.
       let merkle = await ctx.relay.merkle(ctx.vaultId);
@@ -555,6 +575,7 @@ export class FlockSyncEngine {
       if (!isHash(merkle.root)) throw new Error("Malformed relay Merkle root");
       if (merkle.head > cursor) continue;
       if (merkle.head === cursor && merkle.root === root) {
+        this.verifiedHead = { scope: ctx.scope, cursor, state: state.pathTipsHash };
         if (this.io.getData().relayState?.policy !== this.applicationPolicy) {
           throw new CatchUpNeeded("Sync settings changed — reconciliation is pending");
         }
@@ -565,6 +586,7 @@ export class FlockSyncEngine {
       if (!isHash(merkle.root)) throw new Error("Malformed relay Merkle root");
       if (merkle.head > cursor) continue;
       if (merkle.head === cursor && merkle.root === root) {
+        this.verifiedHead = { scope: ctx.scope, cursor, state: state.pathTipsHash };
         if (this.io.getData().relayState?.policy !== this.applicationPolicy) {
           throw new CatchUpNeeded("Sync settings changed — reconciliation is pending");
         }
@@ -581,7 +603,7 @@ export class FlockSyncEngine {
   }
 
   /** Consume a finite observed prefix, never the unconsumed head of a push response. */
-  private async drainPull(ctx: OpCtx, progress: SyncProgress, target?: number): Promise<void> {
+  private async drainPull(ctx: OpCtx, progress: SyncProgress, target?: number): Promise<number> {
     ctx.assertCurrent();
     let pull = await this.pullOps(ctx, this.io.getData().localCursor);
     validatePull(pull, this.io.getData().localCursor);
@@ -609,12 +631,14 @@ export class FlockSyncEngine {
         validatePull(pull, this.io.getData().localCursor);
       }
     }
+    return pull.head;
   }
 
   /** Reconstruct the wire projection, then reconcile causal-maximal state, not superseded history. */
   private async rebuildRelayState(ctx: OpCtx, progress: SyncProgress): Promise<void> {
     ctx.assertCurrent();
     progress.rebuilt = true;
+    this.verifiedHead = null;
     this.io.getData().relayState = null;
     const policy = this.applicationPolicy;
     const tips: Record<string, string | null> = Object.create(null);
@@ -681,6 +705,12 @@ export class FlockSyncEngine {
     for (const [path, { ops, vv }] of [...paths].sort((a, b) =>
       a[1].ops[a[1].ops.length - 1].seq! - b[1].ops[b[1].ops.length - 1].seq!)) {
       const op = ops[ops.length - 1];
+      if (this.canSync(path) && await this.mergeRecoveryVariants(ctx, path, ops)) {
+        reconciled[path] = { hash: op.blobHash, vv, pending: true, pendingMerge: true };
+        this.pendingLocal.add(path);
+        progress.applied++;
+        continue;
+      }
       // Sequence order picks the original, not which concurrent bytes survive.
       // Preserve every distinct maximal live variant before acknowledging joined
       // knowledge. A concurrent tombstone cannot discard another maximal blob.
@@ -713,6 +743,28 @@ export class FlockSyncEngine {
     live.relayState = { cursor, context: ctx.scope, policy, tips, pathTipsHash: hash };
     await this.checkpoint();
     this.status.note(`Relay metadata verified — ${cursor} operations accounted for`);
+  }
+
+  private async mergeRecoveryVariants(ctx: OpCtx, path: string, ops: SignedOp[]): Promise<boolean> {
+    if (ops.length < 2 || !this.isMergeable(path) || this.explicitDeletes.has(path)) return false;
+    const baseHash = ops[0].prevHash;
+    if (!isHash(baseHash) || ops.some((op) => op.prevHash !== baseHash || op.blobHash === null)) return false;
+    const hashes = [...new Set(ops.map((op) => op.blobHash!))];
+    if (hashes.length < 2) return false;
+    const localHash = await this.hashLocalPath(path);
+    const base = await this.tryMergeBaseBytes(ctx, path, baseHash);
+    if (!base) return false;
+    let merged = await this.remoteBytes(ctx, path, hashes[0]);
+    for (const hash of hashes.slice(1)) {
+      const remote = await this.remoteBytes(ctx, path, hash);
+      const result = mergeContent(path, base, merged, remote);
+      if (!result) return false;
+      merged = result;
+    }
+    if (await sha256Hex(merged) === localHash) return true;
+    if (localHash !== null && localHash !== baseHash && !hashes.includes(localHash)) return false;
+    await this.writeLocalBytes(path, merged, localHash);
+    return true;
   }
 
   private async decodePath(ctx: OpCtx, op: SignedOp): Promise<string> {
@@ -762,23 +814,25 @@ export class FlockSyncEngine {
     // Rebuild causal knowledge from this verified log, not possibly corrupt
     // tips (or tips belonging to a different relay/vault/identity context).
     const vv = mergeVv(recovery ? undefined : tip?.vv, knowledge);
-    let localHash = await this.hashLocalPath(path);
-    let pending = false;
     if (!recovery && tip && ((tip.hash === op.blobHash && covers(tip.vv, op.versionVector)) ||
       dominates(tip.vv, op.versionVector))) {
       // Equal vectors are not concurrent. In particular, self echoes must not
       // replace newer local bytes or manufacture another conflict on each retry.
       const known = { ...tip, ...(tip.hash !== op.blobHash ? { pending: true } : {}) };
+      if (known.pending) this.pendingLocal.add(path);
       this.setPathTip(path, known);
       progress.applied++;
       return known;
     }
+    let localHash = await this.hashLocalPath(path);
+    let pending = false;
+    let pendingMerge = false;
     if (localHash !== op.blobHash) {
       const unchanged = !recovery && !!tip && !tip.pending && tip.hash === localHash &&
         dominates(op.versionVector, tip.vv);
       if (op.blobHash === null) {
         if (unchanged) {
-          await this.withWatchSuppressed(() => this.deleteLocalPath(path, localHash));
+          await this.deleteLocalPath(path, localHash);
         } else {
           // No tombstone is permission to erase divergent or untracked bytes.
           pending = true;
@@ -788,7 +842,9 @@ export class FlockSyncEngine {
         const bytes = await this.remoteBytes(ctx, path, op.blobHash);
         // Network/crypto awaits may have allowed a local edit. Decide using the
         // current bytes, not the snapshot from before fetching the blob.
-        localHash = await this.hashLocalPath(path);
+        if (!this.isConfigPath(path)) await this.flushOpenEditors(path);
+        const localBytes = await this.readLocalBytes(path);
+        localHash = localBytes === null ? null : await sha256Hex(localBytes);
         const stillUnchanged = !recovery && !!tip && !tip.pending && tip.hash === localHash &&
           dominates(op.versionVector, tip.vv);
         const newPath = localHash === null && !this.explicitDeletes.has(path) &&
@@ -796,20 +852,65 @@ export class FlockSyncEngine {
         if (localHash === op.blobHash) {
           // Already materialized by a prior, interrupted application.
         } else if (stillUnchanged || newPath) {
-          await this.withWatchSuppressed(() => this.writeLocalBytes(path, bytes, localHash));
+          await this.writeLocalBytes(path, bytes, localHash);
         } else if (op.deviceId === ctx.deviceId && !recovery) {
           // A lost push receipt is our own history, not a second user's conflict.
           pending = true;
         } else {
-          await this.preserveConflict(path, op.blobHash, bytes, progress);
-          pending = true;
+          const baseHash = !recovery && tip ? this.commonBase(tip, op) : null;
+          const merged = localBytes && baseHash ? await this.mergeFromBase(ctx, path, baseHash, localBytes, bytes) : null;
+          if (merged) {
+            const mergedHash = await sha256Hex(merged);
+            if (mergedHash !== localHash) await this.writeLocalBytes(path, merged, localHash);
+            pending = mergedHash !== op.blobHash || !!tip && !covers(op.versionVector, tip.vv);
+            pendingMerge = pending;
+          } else {
+            await this.preserveConflict(path, op.blobHash, bytes, progress);
+            pending = true;
+          }
         }
       }
     }
-    const result: PathTip = { hash: op.blobHash, vv, ...(pending ? { pending: true } : {}) };
+    if (pending) this.pendingLocal.add(path);
+    const result: PathTip = {
+      hash: op.blobHash, vv,
+      ...(pending ? { pending: true } : isHash(op.prevHash) ? { prevHash: op.prevHash } : {}),
+      ...(pendingMerge ? { pendingMerge: true } : {}),
+    };
     this.setPathTip(path, result);
     progress.applied++;
     return result;
+  }
+
+  private commonBase(tip: PathTip, op: SignedOp): string | null {
+    if (!isHash(op.prevHash)) return null;
+    if (tip.pending) return tip.pendingMerge && tip.hash === op.prevHash ? op.prevHash : null;
+    if (tip.hash === op.prevHash && covers(op.versionVector, tip.vv)) return op.prevHash;
+    if (tip.prevHash === op.prevHash && !covers(op.versionVector, tip.vv) &&
+      !covers(tip.vv, op.versionVector)) return op.prevHash;
+    return null;
+  }
+
+  private async mergeFromBase(
+    ctx: OpCtx, path: string, baseHash: string, local: Uint8Array, remote: Uint8Array
+  ): Promise<Uint8Array | null> {
+    if (!this.isMergeable(path)) return null;
+    const base = await this.tryMergeBaseBytes(ctx, path, baseHash);
+    return base ? mergeContent(path, base, local, remote) : null;
+  }
+
+  private isMergeable(path: string): boolean {
+    return !this.isConfigPath(path) && /\.(?:md|canvas)$/i.test(path);
+  }
+
+  private async tryMergeBaseBytes(ctx: OpCtx, path: string, baseHash: string): Promise<Uint8Array | null> {
+    try {
+      return await this.remoteBytes(ctx, path, baseHash);
+    } catch (error) {
+      ctx.assertCurrent();
+      if (error instanceof MissingBlob) return null;
+      throw error;
+    }
   }
 
   private async remoteBytes(ctx: OpCtx, path: string, hash: string): Promise<Uint8Array> {
@@ -820,7 +921,11 @@ export class FlockSyncEngine {
       bytes = await open(key, bytesToB64(new Uint8Array(packed)));
     } catch (error) {
       ctx.assertCurrent();
-      throw new Error(`Could not fetch/decrypt blob for ${path}: ${error instanceof Error ? error.message : error}`);
+      const message = `Could not fetch/decrypt blob for ${path}: ${error instanceof Error ? error.message : error}`;
+      if (error instanceof RelayError && error.status === 404 && /blob not found/i.test(error.message)) {
+        throw new MissingBlob(message);
+      }
+      throw new Error(message);
     }
     if (await sha256Hex(bytes) !== hash) throw new Error(`Checksum mismatch for ${path}`);
     ctx.assertCurrent();
@@ -846,7 +951,7 @@ export class FlockSyncEngine {
       if (existingHash !== null && existingHash !== hash) continue;
       if (existingHash === null) {
         const content = typeof bytes === "function" ? await bytes() : bytes;
-        await this.withWatchSuppressed(() => this.writeLocalBytes(target, content, null));
+        await this.writeLocalBytes(target, content, null);
         progress.conflicts++;
         this.status.note(`Conflict: ${path} — kept local, saved remote as ${target}`);
       }
@@ -976,15 +1081,6 @@ export class FlockSyncEngine {
     return { ...unsigned, sigB64 };
   }
 
-  private async withWatchSuppressed<T>(fn: () => Promise<T>): Promise<T> {
-    this.suppressWatchDepth++;
-    try {
-      return await fn();
-    } finally {
-      this.suppressWatchDepth--;
-    }
-  }
-
   private async localKind(path: string): Promise<"file" | "folder" | null> {
     this.assertRunContext();
     if (this.isConfigPath(path)) {
@@ -1040,13 +1136,19 @@ export class FlockSyncEngine {
     if (await this.hashLocalPath(path) !== expectedHash) throw new CatchUpNeeded(`Local file changed during sync: ${path}`);
     this.assertRunContext();
     const existing = this.app.vault.getAbstractFileByPath(path);
-    if (existing instanceof TFile) {
-      await this.app.vault.modifyBinary(existing, ab);
-    } else {
-      await this.app.vault.createBinary(normalizePath(path), ab);
-    }
+    if (existing instanceof TFile) await this.app.vault.modifyBinary(existing, ab);
+    else await this.app.vault.createBinary(normalizePath(path), ab);
     this.assertRunContext();
-    this.reloadOpenViews(path);
+    if (/\.canvas$/i.test(path)) {
+      this.pendingCanvasReloads.add(path);
+      await this.reloadOpenViews(path);
+      if (await this.hashLocalPath(path, false) !== await sha256Hex(bytes)) {
+        this.markLocalChange(path);
+        this.pendingLocal.add(path);
+        this.scheduleSync();
+        throw new CatchUpNeeded(`Canvas changed during reload: ${path}`);
+      }
+    }
   }
 
   private async deleteLocalPath(path: string, expectedHash: string | null): Promise<void> {
@@ -1060,7 +1162,14 @@ export class FlockSyncEngine {
     }
     const file = this.app.vault.getAbstractFileByPath(path);
     if (file instanceof TFolder) throw new Error(`Refusing to delete a folder: ${path}`);
-    if (file instanceof TFile) await this.app.vault.delete(file);
+    if (file instanceof TFile) {
+      this.deletingRemotePaths.add(path);
+      try {
+        await this.app.vault.delete(file);
+      } finally {
+        this.deletingRemotePaths.delete(path);
+      }
+    }
     this.assertRunContext();
   }
 
@@ -1123,19 +1232,23 @@ export class FlockSyncEngine {
     return files;
   }
 
-  /** Hash tracked files too: an edit while the plugin was closed has no watch event. */
-  private async scanLocalChanges(): Promise<void> {
+  /** Reconciliation catches edits made while watch events were unavailable. */
+  private async scanLocalChanges(full: boolean, config = full): Promise<void> {
     this.assertRunContext();
     for (const { oldPath, newPath } of this.pendingRenames.splice(0)) {
       if (this.canSync(oldPath)) this.pendingDeletes.add(oldPath);
       if (this.canSync(newPath)) this.pendingLocal.add(newPath);
     }
-    const paths = new Set([
-      ...this.app.vault.getFiles().map((file) => file.path),
-      ...await this.listConfigFiles(),
-      ...Object.keys(this.io.getData().pathTips),
-      ...this.pendingLocal, ...this.pendingDeletes,
-    ]);
+    const paths = new Set([...this.pendingLocal, ...this.pendingDeletes]);
+    if (full || config) {
+      for (const path of Object.keys(this.io.getData().pathTips)) {
+        if (full || this.isConfigPath(path)) paths.add(path);
+      }
+      for (const path of await this.listConfigFiles()) paths.add(path);
+    }
+    if (full) {
+      for (const file of this.app.vault.getFiles()) paths.add(file.path);
+    }
     for (const path of paths) {
       if (!this.canSync(path)) {
         this.pendingLocal.delete(path);
@@ -1230,6 +1343,7 @@ export class FlockSyncEngine {
       this.setPathTip(path, {
         hash: op.blobHash, vv: mergeVv(tip?.vv, op.versionVector),
         ...(!covers(op.versionVector, tip?.vv ?? {}) ? { pending: true } : {}),
+        ...(isHash(op.prevHash) ? { prevHash: op.prevHash } : {}),
       });
       if ((this.pathRevisions.get(path) ?? 0) === revision) {
         this.pendingLocal.delete(path);
@@ -1250,6 +1364,7 @@ export class FlockSyncEngine {
     const ctx = this.activeContext;
     ctx?.assertCurrent();
     const target = normalizeVaultPath(path);
+    if (this.pendingCanvasReloads.has(target)) await this.reloadOpenViews(target);
     const views: Array<{ save?: () => Promise<void> }> = [];
     this.app.workspace.iterateAllLeaves((leaf) => {
       const view = leaf.view as {
@@ -1275,21 +1390,23 @@ export class FlockSyncEngine {
   }
 
   /** Rebuild open canvas leaves for a path so pulled content shows up. */
-  private reloadOpenViews(path: string): void {
-    const target = normalizeVaultPath(path);
-    if (!target.toLowerCase().endsWith(".canvas")) return;
+  private async reloadOpenViews(target: string): Promise<void> {
+    const rebuilds: Array<() => void | Promise<void>> = [];
     this.app.workspace.iterateAllLeaves((leaf) => {
       const view = leaf.view as { file?: TFile; getViewType?: () => string };
       const file = view.file;
       if (!file || normalizeVaultPath(file.path) !== target) return;
       if ((view.getViewType?.() ?? "") !== "canvas") return;
-      try {
-        const rebuild = (leaf as { rebuildView?: () => void | Promise<void> }).rebuildView;
-        if (typeof rebuild === "function") void rebuild.call(leaf);
-      } catch {
-        /* ignore */
-      }
+      const rebuild = (leaf as { rebuildView?: () => void | Promise<void> }).rebuildView;
+      if (typeof rebuild === "function") rebuilds.push(() => rebuild.call(leaf));
+      else rebuilds.push(() => { throw new Error(`Cannot safely reload the open canvas for ${target}`); });
     });
+    for (const rebuild of rebuilds) {
+      this.assertRunContext();
+      await rebuild();
+    }
+    this.assertRunContext();
+    this.pendingCanvasReloads.delete(target);
   }
 }
 

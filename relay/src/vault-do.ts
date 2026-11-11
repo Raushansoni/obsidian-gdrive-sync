@@ -7,6 +7,7 @@
 // RPC surface (worker calls stub.fetch with a JSON body; op comes from the path):
 //   POST /push    { ops: SignedOp[] }        -> { seqs: number[], head }
 //   POST /pull    { after: number }          -> { ops: SignedOp[], head }   (limit 200)
+//   POST /wait    { after: number }          -> { head } on change or timeout
 //   POST /merkle  {}                         -> { root, head }
 
 // @ts-expect-error "cloudflare:workers" is a runtime module provided by workerd; no types package is shipped.
@@ -17,6 +18,8 @@ import type { DoFailure } from "./http";
 import type { SignedOp } from "./protocol";
 
 const PULL_LIMIT = 200;
+const HEAD_WAIT_MS = 10_000;
+const MAX_HEAD_WAITERS = 128;
 
 interface OpRow {
   seq: number;
@@ -31,10 +34,13 @@ interface OpRow {
 
 export type VaultPushResult = { ok: true; seqs: number[]; head: number } | DoFailure;
 export type VaultPullResult = { ok: true; ops: SignedOp[]; head: number } | DoFailure;
+export type VaultWaitResult = { ok: true; head: number } | DoFailure;
 export type VaultMerkleResult = { ok: true; root: string; head: number } | DoFailure;
 
 export class VaultLog extends DurableObject {
   private readonly sql: SqlStorage;
+  private readonly headWaiters = new Set<(head: number) => void>();
+  private merkleCache: { head: number; root: Promise<string> } | undefined;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -66,6 +72,13 @@ export class VaultLog extends DurableObject {
         case "pull": {
           const after = body && typeof body.after === "number" ? body.after : 0;
           return replyJson(await this.pull(after));
+        }
+        case "wait": {
+          const after = body?.after;
+          if (typeof after !== "number" || !Number.isSafeInteger(after) || after < 0) {
+            return replyJson({ ok: false, code: "bad_request", error: "after must be a non-negative integer" });
+          }
+          return replyJson(await this.waitForHead(after));
         }
         case "merkle":
           return replyJson(await this.merkle());
@@ -118,7 +131,11 @@ export class VaultLog extends DurableObject {
       seqs.push(this.headValue());
     }
 
-    return { ok: true, seqs, head: this.headValue() };
+    const head = seqs[seqs.length - 1] ?? this.headValue();
+    if (seqs.length > 0) {
+      for (const notify of this.headWaiters) notify(head);
+    }
+    return { ok: true, seqs, head };
   }
 
   private async pull(after: number): Promise<VaultPullResult> {
@@ -132,7 +149,47 @@ export class VaultLog extends DurableObject {
     return { ok: true, ops: rows.map(toSignedOp), head: this.headValue() };
   }
 
+  private async waitForHead(after: number): Promise<VaultWaitResult> {
+    const head = this.headValue();
+    if (head !== after) return { ok: true, head };
+    if (this.headWaiters.size >= MAX_HEAD_WAITERS) {
+      return { ok: false, code: "rate_limited", error: "too many open head waits" };
+    }
+    // Register synchronously after reading the head so a push cannot slip in between.
+    return new Promise((resolve, reject) => {
+      const notify = (nextHead: number) => {
+        clearTimeout(timer);
+        this.headWaiters.delete(notify);
+        resolve({ ok: true, head: nextHead });
+      };
+      const timer = setTimeout(() => {
+        this.headWaiters.delete(notify);
+        try {
+          resolve({ ok: true, head: this.headValue() });
+        } catch (error) {
+          reject(error);
+        }
+      }, HEAD_WAIT_MS);
+      this.headWaiters.add(notify);
+    });
+  }
+
   private async merkle(): Promise<VaultMerkleResult> {
+    const head = this.headValue();
+    let cache = this.merkleCache;
+    if (cache?.head !== head) {
+      cache = { head, root: this.computeMerkleRoot() };
+      this.merkleCache = cache;
+    }
+    try {
+      return { ok: true, root: await cache.root, head };
+    } catch (error) {
+      if (this.merkleCache === cache) this.merkleCache = undefined;
+      throw error;
+    }
+  }
+
+  private computeMerkleRoot(): Promise<string> {
     // Latest row per path_cipher (max seq wins: tombstone overwrites the tip).
     const rows = this.sql
       .exec<{ path_cipher: string; blob_hash: string | null }>(
@@ -150,7 +207,7 @@ export class VaultLog extends DurableObject {
     const canonical = JSON.stringify(
       Object.fromEntries(Object.keys(tips).sort().map((k) => [k, tips[k]]))
     );
-    return { ok: true, root: await sha256Hex(canonical), head: this.headValue() };
+    return sha256Hex(canonical);
   }
 
   // --------------------------------------------------------------- helpers ---

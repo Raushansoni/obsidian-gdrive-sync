@@ -275,7 +275,7 @@ async function device(relay, initial = {}, stored = {}) {
       client.setBase(url);
       await saveData();
     },
-    sync: () => runAndSettle(() => engine.sync()),
+    sync: (options) => runAndSettle(() => engine.sync(options)),
     resync: () => runAndSettle(() => engine.resyncFromRelay()),
     restart() {
       liveData = production.sanitizePluginData(structuredClone(persisted));
@@ -283,6 +283,172 @@ async function device(relay, initial = {}, stored = {}) {
     },
   };
 }
+
+test("seamless-incremental: warm sync reads changed paths without scanning the vault", async () => {
+  const relay = await new TestRelay().init();
+  const writer = await device(relay, { "Changed.md": "before", "Unrelated.md": "untouched" });
+  await writer.sync();
+
+  const read = writer.vault.readBinary.bind(writer.vault);
+  const list = writer.vault.getFiles.bind(writer.vault);
+  let scans = 0;
+  const reads = [];
+  writer.vault.getFiles = () => { scans++; return list(); };
+  writer.vault.readBinary = (file) => { reads.push(file.path); return read(file); };
+  await writer.sync({ full: false });
+  equal(scans, 0, "Idle incremental sync must not enumerate the vault");
+  equal(reads, [], "Idle incremental sync must not read vault files");
+  writer.vault.edit("Changed.md", "after");
+  await writer.sync({ full: false });
+  equal(scans, 0, "A watched edit must not enumerate the vault");
+  ok(reads.includes("Changed.md") && !reads.includes("Unrelated.md"), "Only changed bytes are read");
+
+  const reader = await device(relay);
+  await reader.sync();
+  equal(reader.vault.text("Changed.md"), "after", "A queued edit reaches the other device");
+});
+
+test("seamless-markdown: two devices merge independent paragraphs and converge", async () => {
+  const relay = await new TestRelay().init();
+  const desktop = await device(relay, { "Note.md": "First paragraph.\n\nSecond paragraph.\n" });
+  await desktop.sync();
+  const phone = await device(relay);
+  await phone.sync();
+  desktop.vault.edit("Note.md", "Edited on desktop.\n\nSecond paragraph.\n");
+  phone.vault.edit("Note.md", "First paragraph.\n\nEdited on phone.\n");
+  await phone.sync({ full: false });
+  await desktop.sync({ full: false });
+  await phone.sync({ full: false });
+  const expected = "Edited on desktop.\n\nEdited on phone.\n";
+  for (const endpoint of [desktop, phone]) {
+    equal(endpoint.vault.text("Note.md"), expected, "Both paragraph changes reach each device");
+    equal(endpoint.vault.getFiles().map(({ path }) => path), ["Note.md"], "Independent edits do not create siblings");
+  }
+});
+
+test("seamless-offline-replay: sequential incoming edits merge with one pending offline edit", async () => {
+  const relay = await new TestRelay().init();
+  const desktop = await device(relay, { "Note.md": "First.\nSecond.\nThird.\n" });
+  await desktop.sync();
+  const phone = await device(relay);
+  await phone.sync();
+  desktop.vault.edit("Note.md", "Desktop first.\nSecond.\nThird.\n");
+  phone.vault.edit("Note.md", "First.\nPhone second.\nThird.\n");
+  await phone.sync({ full: false });
+  phone.vault.edit("Note.md", "First.\nPhone second.\nPhone third.\n");
+  await phone.sync({ full: false });
+
+  await desktop.sync({ full: false });
+  await phone.sync({ full: false });
+  for (const endpoint of [desktop, phone]) {
+    equal(endpoint.vault.text("Note.md"), "Desktop first.\nPhone second.\nPhone third.\n",
+      "Both remote edits are replayed against the independent offline edit");
+    equal(endpoint.vault.getFiles().map(({ path }) => path), ["Note.md"], "Safe sequential merges do not create siblings");
+  }
+});
+
+test("seamless-base-fetch-retry: a transient merge-base failure does not create a conflict", async () => {
+  const relay = await new TestRelay().init();
+  const base = await relay.remote("Note.md", "First.\nSecond.\n");
+  const desktop = await device(relay);
+  await desktop.sync();
+  desktop.vault.edit("Note.md", "Desktop first.\nSecond.\n");
+  await relay.remote("Note.md", "First.\nPhone second.\n");
+  await relay.failBlobOnce(base.blobHash, "fetch");
+  await desktop.sync({ full: false });
+  ok(desktop.status.state !== "synced", "A failed merge-base fetch stays retryable");
+  equal(desktop.vault.getFiles().map(({ path }) => path), ["Note.md"], "A temporary transport failure creates no sibling");
+
+  await desktop.sync({ full: false });
+  equal(desktop.vault.text("Note.md"), "Desktop first.\nPhone second.\n", "Both edits merge after the base becomes available");
+  equal(desktop.vault.getFiles().map(({ path }) => path), ["Note.md"], "Successful retry creates no sibling");
+});
+
+test("seamless-concurrent-push: independent edits merge when both uploads start from one base", async () => {
+  const relay = await new TestRelay().init();
+  const base = await relay.remote("Note.md", "First.\nSecond.\n");
+  const desktop = await device(relay);
+  await desktop.sync();
+  desktop.vault.edit("Note.md", "Edited on desktop.\nSecond.\n");
+  relay.beforePush = () => relay.remote("Note.md", "First.\nEdited on phone.\n", {
+    pathCipherB64: base.pathCipherB64,
+  });
+  await desktop.sync({ full: false });
+  const phone = await device(relay);
+  await phone.sync();
+  for (const endpoint of [desktop, phone]) {
+    equal(endpoint.vault.text("Note.md"), "Edited on desktop.\nEdited on phone.\n", "Both committed edits converge");
+    equal(endpoint.vault.getFiles().map(({ path }) => path), ["Note.md"], "An interleaved compatible push does not create siblings");
+  }
+});
+
+test("seamless-canvas: two devices merge a move and text edit while the board is open", async () => {
+  const relay = await new TestRelay().init();
+  const canvas = (x, text) => JSON.stringify({
+    nodes: [{ id: "card", type: "text", x, y: 0, width: 200, height: 100, text }],
+    edges: [],
+  });
+  const desktop = await device(relay, { "Board.canvas": canvas(0, "original") });
+  await desktop.sync();
+  const phone = await device(relay);
+  await phone.sync();
+  desktop.vault.edit("Board.canvas", canvas(40, "original"));
+  phone.vault.edit("Board.canvas", canvas(0, "changed on phone"));
+  await phone.sync({ full: false });
+
+  let editorState = desktop.vault.text("Board.canvas");
+  let rebuilt = false;
+  desktop.workspace.leaves.push({
+    view: {
+      file: desktop.vault.getAbstractFileByPath("Board.canvas"),
+      getViewType: () => "canvas",
+      async save() {
+        if (editorState !== desktop.vault.text("Board.canvas")) desktop.vault.edit("Board.canvas", editorState);
+      },
+    },
+    async rebuildView() {
+      await delay(40);
+      editorState = desktop.vault.text("Board.canvas");
+      rebuilt = true;
+    },
+  });
+
+  await desktop.sync({ full: false });
+  await phone.sync({ full: false });
+  ok(rebuilt, "The open canvas is reloaded before the engine reads it again");
+  for (const endpoint of [desktop, phone]) {
+    const { nodes: [card] } = JSON.parse(endpoint.vault.text("Board.canvas"));
+    equal([card.x, card.text], [40, "changed on phone"], "Both independent card changes reach each device");
+    equal(endpoint.vault.getFiles().map(({ path }) => path), ["Board.canvas"], "Independent canvas edits do not create siblings");
+  }
+});
+
+test("seamless-canvas-stale-save: retry when rebuilding a board saves its old bytes", async () => {
+  const relay = await new TestRelay().init();
+  const oldCanvas = JSON.stringify({ nodes: [{ id: "card", type: "text", text: "old" }], edges: [] });
+  const newCanvas = JSON.stringify({ nodes: [{ id: "card", type: "text", text: "remote" }], edges: [] });
+  await relay.remote("Board.canvas", oldCanvas);
+  const local = await device(relay);
+  await local.sync();
+  let rebuilds = 0;
+  local.workspace.leaves.push({
+    view: {
+      file: local.vault.getAbstractFileByPath("Board.canvas"),
+      getViewType: () => "canvas",
+      async save() {},
+    },
+    async rebuildView() {
+      if (++rebuilds === 1) local.vault.edit("Board.canvas", oldCanvas);
+    },
+  });
+
+  await relay.remote("Board.canvas", newCanvas);
+  await local.sync({ full: false });
+  await local.sync({ full: false });
+  equal(local.vault.text("Board.canvas"), newCanvas, "A stale rebuild save cannot silently roll back the remote board");
+  equal(local.vault.getFiles().map(({ path }) => path), ["Board.canvas"], "Replaying an unchanged stale save creates no sibling");
+  equal(relay.ops.at(-1).blobHash, digest(newCanvas), "The relay tip stays on the incoming board");
+});
 
 test("control: real encrypted note, allowed config, and tombstone sync", async () => {
   const relay = await new TestRelay().init();
@@ -791,10 +957,10 @@ test("review-relay-url-switch: changing relay after final verification cannot ce
   const successAt = local.status.lastSyncAt;
   const snapshotStart = local.snapshots.length;
   const changedUrl = "https://switched-sync-recovery.invalid";
-  let verifications = 0;
   relay.afterMerkle = () => {
-    // A healthy no-change pass verifies before its first scan and again before its final scan.
-    if (++verifications === 2) local.vault.beforeNextRead = () => local.setRelayUrl(changedUrl);
+    // An idle full sync verifies once, before it reads the vault for reconciliation.
+    relay.afterMerkle = null;
+    local.vault.beforeNextRead = () => local.setRelayUrl(changedUrl);
   };
   await local.sync();
   equal(local.relayUrl, changedUrl, "The final-read barrier must apply the real settings URL/base mutation and save replacement");

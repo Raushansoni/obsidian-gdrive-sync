@@ -58,7 +58,7 @@ function assert(cond, msg) {
   if (!cond) throw new Error(msg);
 }
 
-async function request(method, path, { body, token, raw } = {}) {
+async function request(method, path, { body, token, raw, signal } = {}) {
   const headers = {};
   if (token) headers.Authorization = `Device ${token.deviceId} ${token.token}`;
   let payload;
@@ -69,7 +69,7 @@ async function request(method, path, { body, token, raw } = {}) {
     headers["Content-Type"] = "application/json";
     payload = JSON.stringify(body);
   }
-  const res = await fetch(`${BASE}${path}`, { method, headers, body: payload });
+  const res = await fetch(`${BASE}${path}`, { method, headers, body: payload, signal });
   const buf = await res.arrayBuffer();
   const text = new TextDecoder().decode(buf);
   let json = null;
@@ -396,11 +396,29 @@ async function main() {
     });
 
     let op1, op2, op3;
-    check("POST ops: signed op pushes, seq assigned", async () => {
+    check("GET wait requires auth and validates the cursor", async () => {
+      const path = `/v1/vaults/${vaultId}/wait`;
+      const unauthenticated = await request("GET", `${path}?after=0`);
+      assert(unauthenticated.status === 401, `missing auth -> ${unauthenticated.status} ${unauthenticated.text}`);
+      const invalid = await request("GET", `${path}?after=0.5`, { token: host.token });
+      assert(invalid.status === 400, `invalid cursor -> ${invalid.status} ${invalid.text}`);
+      const ahead = await request("GET", `${path}?after=1`, { token: host.token, signal: AbortSignal.timeout(5000) });
+      assert(ahead.status === 200 && ahead.json.head === 0, `head moved back -> ${ahead.status} ${ahead.text}`);
+    });
+
+    check("POST ops assigns a sequence and wakes a waiting client", async () => {
       op1 = await signOp(host, await mkOp(host, pathA, sha256Hex(blobPlain), null, 1));
+      const pending = request("GET", `/v1/vaults/${vaultId}/wait?after=0`, {
+        token: host.token,
+        signal: AbortSignal.timeout(5000),
+      });
+      // Give the wait request time to reach the relay before appending.
+      await new Promise((resolve) => setTimeout(resolve, 100));
       const r = await request("POST", `/v1/vaults/${vaultId}/ops`, { token: host.token, body: { ops: [op1] } });
+      const notified = await pending;
       assert(r.status === 200, `push -> ${r.status} ${r.text}`);
       assert(r.json.ops[0].seq === 1 && r.json.head === 1, `seq/head: ${r.text}`);
+      assert(notified.status === 200 && notified.json.head === 1, `wait -> ${notified.status} ${notified.text}`);
     });
 
     check("POST ops: tampered signature → 401", async () => {

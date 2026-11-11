@@ -7,7 +7,7 @@ Pair your devices once, link a vault, and Flock Sync keeps it in sync through a 
 - Works in Obsidian Desktop **and** Obsidian Mobile (`isDesktopOnly: false`, minAppVersion 1.11.4)
 - Pairing with a 3-digit nameplate + two words — or scan a QR code
 - End-to-end encryption (AES-GCM); the relay stores only encrypted blobs
-- Conflicts become **sibling files**, never a silent last-write-wins overwrite
+- Independent edits merge automatically in Markdown and Canvas. Unresolved edits are preserved in **sibling files**.
 - Recovery via **32 wordlist words** from your flock secret
 
 ## How it works
@@ -149,16 +149,18 @@ The status bar item starts with `Flock:` and clicking it runs a sync.
 | `Flock: Conflict …` | Conflicting edits were kept as sibling files (see below) |
 | `Flock: Error` | Sync failed — hover for the detail, check settings for the last error |
 
-### Conflicts
+### Sync and conflicts
 
-If the same file changed on two devices between syncs, Flock Sync does **not** silently pick a winner. Both versions survive as siblings:
+While Obsidian is visible, Flock can pull as soon as the relay announces a change. The configured sync interval still provides a polling fallback. Routine sync processes changed paths, with full vault checks on startup, resume, manual sync, and periodically.
+
+Flock merges independent Markdown line edits and Canvas changes to different cards, connections, or fields when both versions share a known base. If changes overlap or Flock cannot establish a safe merge, it keeps both versions. For example, you may see:
 
 ```
 Note.md
-Note (conflict 2026-10-02).md
+Note (conflict c602d25f87b8).md
 ```
 
-Merge by hand, then delete the copy you don't want. Conflict files are synced too, so every device sees both versions.
+Review both versions, combine the edits you want, and delete the sibling after resolving it. Conflict copies sync to the other devices in the vault.
 
 ### Ignore patterns
 

@@ -9,8 +9,12 @@ export interface StatusLogEntry {
 export interface PathTip {
   hash: string | null;
   vv: Record<string, number>;
+  /** Previous content of an acknowledged version, when available for a three-way merge. */
+  prevHash?: string;
   /** Incoming knowledge retained with local bytes; publish even if the hash is unchanged. */
   pending?: boolean;
+  /** Pending local bytes already incorporate the acknowledged remote hash. */
+  pendingMerge?: boolean;
 }
 
 export interface RelayState {
@@ -102,11 +106,15 @@ function readPathTips(raw: unknown): Record<string, PathTip> | null {
   for (const [path, tip] of Object.entries(raw)) {
     if (!isSyncPath(path) || !isRecord(tip) ||
       !(tip.hash === null || isHash(tip.hash)) || !isVersionVector(tip.vv) ||
-      (tip.pending !== undefined && typeof tip.pending !== "boolean")) return null;
+      (tip.pending !== undefined && typeof tip.pending !== "boolean") ||
+      (tip.pendingMerge !== undefined && (tip.pendingMerge !== true || tip.pending !== true || tip.hash === null)) ||
+      (tip.prevHash !== undefined && !isHash(tip.prevHash))) return null;
     entries.push([path, {
       hash: tip.hash,
       vv: { ...tip.vv },
+      ...(typeof tip.prevHash === "string" ? { prevHash: tip.prevHash } : {}),
       ...(tip.pending === true ? { pending: true } : {}),
+      ...(tip.pendingMerge === true ? { pendingMerge: true } : {}),
     }]);
   }
   return Object.fromEntries(entries);

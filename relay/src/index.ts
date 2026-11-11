@@ -3,7 +3,7 @@
 //   Pairing mailbox:   /v1/pair/start | claim | msg | inbox | finish | guest-finish
 //   Flock admin:       /v1/flock, /v1/devices/approve, /v1/devices/revoke
 //   Vault enrollment:  /v1/vaults (POST upsert sealed meta, GET list)
-//   Vault log/blobs:   /v1/vaults/:vaultId/ops | merkle | blobs/:blobHash
+//   Vault log/blobs:   /v1/vaults/:vaultId/ops | wait | merkle | blobs/:blobHash
 //
 // Pairing routes are untrusted (nameplate-keyed Durable Objects). Every flock/vault
 // route requires `Authorization: Device {deviceId} {token}` (hashed, D1 lookup).
@@ -31,7 +31,7 @@ import type { DeviceRow, VaultRow } from "./d1";
 import { authenticateDevice, authenticateRequest } from "./auth";
 import { verifyOpSignature } from "./verify-op";
 import type { InboxResult, InfoResult, MarkFinishedResult, MsgResult, ClaimResult, StartResult } from "./pair-do";
-import type { VaultMerkleResult, VaultPullResult, VaultPushResult } from "./vault-do";
+import type { VaultMerkleResult, VaultPullResult, VaultPushResult, VaultWaitResult } from "./vault-do";
 import { MAX_BLOB_BYTES, PAIR_TTL_MS } from "./protocol";
 import type {
   MerkleResponse,
@@ -74,13 +74,14 @@ export default {
       if (method === "GET" && path === "/v1/vaults") return await vaultList(req, env);
 
       // --- vault log + blobs ----------------------------------------------
-      const vaultRoute = /^\/v1\/vaults\/([^/]+)\/(ops|merkle|blobs)(?:\/([^/]+))?$/.exec(path);
+      const vaultRoute = /^\/v1\/vaults\/([^/]+)\/(ops|wait|merkle|blobs)(?:\/([^/]+))?$/.exec(path);
       if (vaultRoute) {
         const vaultId = decodeURIComponent(vaultRoute[1]);
         const sub = vaultRoute[2];
         const tail = vaultRoute[3] !== undefined ? decodeURIComponent(vaultRoute[3]) : null;
         if (sub === "ops" && method === "POST") return await vaultOpsPush(req, env, vaultId);
         if (sub === "ops" && method === "GET") return await vaultOpsPull(req, env, vaultId, url);
+        if (sub === "wait" && tail === null && method === "GET") return await vaultWait(req, env, vaultId, url);
         if (sub === "merkle" && method === "GET") return await vaultMerkle(req, env, vaultId);
         if (sub === "blobs" && tail !== null) {
           if (method === "PUT") return await blobPut(req, env, vaultId, tail);
@@ -618,6 +619,22 @@ async function vaultMerkle(req: Request, env: Env, vaultId: string): Promise<Res
 
   const response: MerkleResponse = { root: result.root, head: result.head };
   return json(response);
+}
+
+async function vaultWait(req: Request, env: Env, vaultId: string, url: URL): Promise<Response> {
+  const context = await vaultContext(req, env, vaultId);
+  if (context instanceof Response) return context;
+
+  const raw = url.searchParams.get("after");
+  const after = Number(raw);
+  if (raw === null || !/^\d+$/.test(raw) || !Number.isSafeInteger(after)) {
+    return err(400, "bad_request", "after must be a non-negative integer");
+  }
+  const result = await doJson<VaultWaitResult>(await vaultStub(env, vaultId), "wait", { after });
+  if (!result.ok) return doErrorToResponse(result);
+  const response = json({ head: result.head });
+  response.headers.set("Cache-Control", "no-store");
+  return response;
 }
 
 // ---------------------------------------------------------------- blobs ----

@@ -33,7 +33,8 @@ export function relayRoot(tips: Record<string, string | null>): Promise<string> 
 export function pathTipsHash(tips: Record<string, PathTip>): Promise<string> {
   return sha256Hex(JSON.stringify(Object.keys(tips).sort().map((path) => {
     const tip = tips[path];
-    return [path, tip.hash, Object.keys(tip.vv).sort().map((key) => [key, tip.vv[key]]), !!tip.pending];
+    return [path, tip.hash, Object.keys(tip.vv).sort().map((key) => [key, tip.vv[key]]), !!tip.pending,
+      ...(tip.prevHash ? [tip.prevHash] : []), ...(tip.pendingMerge ? [true] : [])];
   })));
 }
 

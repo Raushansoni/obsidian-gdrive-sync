@@ -9,6 +9,7 @@ import { StatusMachine } from "./status/machine";
 import { DEEP_LINK_ACTION } from "./protocol";
 
 const RIBBON_ICON_ID = "flock-sync-icon";
+const RELAY_RETRY_MS = 5000;
 
 export default class FlockSyncPlugin extends Plugin {
   data: PluginData = DEFAULT_DATA;
@@ -19,6 +20,9 @@ export default class FlockSyncPlugin extends Plugin {
   status = new StatusMachine();
   private statusBarEl: HTMLElement | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private relayRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private listeningForRelay = false;
+  private autoSyncStopped = false;
   refreshSettingsTab: (() => void) | null = null;
   private lastPaintedState: string | null = null;
 
@@ -106,21 +110,22 @@ export default class FlockSyncPlugin extends Plugin {
     );
 
     this.app.workspace.onLayoutReady(() => {
+      if (this.autoSyncStopped) return;
+      if (this.data.autoSync && this.identity.hasFlock() && this.data.enrolled) void this.syncNow(false);
       this.restartAutoSync();
-      if (this.identity.hasFlock() && this.data.enrolled && this.data.autoSync) {
-        window.setTimeout(() => void this.syncNow(false), 1500);
-      }
     });
 
     this.registerDomEvent(document, "visibilitychange", () => {
-      if (document.visibilityState !== "visible") return;
-      if (this.identity.hasFlock() && this.data.enrolled) void this.syncNow(false);
+      if (document.visibilityState === "visible" && this.data.autoSync && this.identity.hasFlock() && this.data.enrolled) {
+        void this.syncNow(false);
+      }
+      this.restartAutoSync();
     });
   }
 
   onunload(): void {
-    if (this.pollTimer) clearInterval(this.pollTimer);
-    this.pollTimer = null;
+    this.autoSyncStopped = true;
+    this.restartAutoSync();
     this.pairing?.cancel();
   }
 
@@ -194,9 +199,58 @@ export default class FlockSyncPlugin extends Plugin {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
-    if (!this.data.autoSync || !this.identity.hasFlock() || !this.data.enrolled) return;
+    if (this.relayRetryTimer) {
+      clearTimeout(this.relayRetryTimer);
+      this.relayRetryTimer = null;
+    }
+    if (!this.canAutoSync()) return;
     const ms = Math.max(15, this.data.syncIntervalSeconds) * 1000;
-    this.pollTimer = setInterval(() => void this.engine?.sync(), ms);
+    this.pollTimer = setInterval(() => {
+      void this.engine?.sync({ full: false });
+      if (!this.relayRetryTimer) void this.listenForRelay();
+    }, ms);
+    void this.listenForRelay();
+  }
+
+  private canAutoSync(): boolean {
+    return !this.autoSyncStopped && this.data.autoSync && this.identity.hasFlock() && this.data.enrolled;
+  }
+
+  private canListenForRelay(): boolean {
+    return this.canAutoSync() && document.visibilityState === "visible";
+  }
+
+  private async listenForRelay(): Promise<void> {
+    if (this.listeningForRelay || !this.canListenForRelay()) return;
+    this.listeningForRelay = true;
+    let retryDelay = 0;
+    try {
+      while (this.canListenForRelay() && this.data.vaultId) {
+        const { vaultId, relayUrl, localCursor } = this.data;
+        const deviceId = this.identity.deviceId;
+        const head = await this.relay.waitForHead(vaultId, localCursor);
+        if (!this.canListenForRelay()) return;
+        if (vaultId !== this.data.vaultId || relayUrl !== this.data.relayUrl ||
+          deviceId !== this.identity.deviceId || localCursor !== this.data.localCursor) continue;
+        if (head === localCursor) continue;
+        await this.engine?.sync({ full: false });
+        if (vaultId === this.data.vaultId && this.data.localCursor === localCursor) {
+          retryDelay = RELAY_RETRY_MS;
+          return;
+        }
+      }
+    } catch {
+      // The polling timer also supports older relays and temporary transport failures.
+      retryDelay = Math.max(RELAY_RETRY_MS, this.data.syncIntervalSeconds * 1000);
+    } finally {
+      this.listeningForRelay = false;
+      if (retryDelay && this.canListenForRelay()) {
+        this.relayRetryTimer = setTimeout(() => {
+          this.relayRetryTimer = null;
+          void this.listenForRelay();
+        }, retryDelay);
+      }
+    }
   }
 
   paintStatus(): void {

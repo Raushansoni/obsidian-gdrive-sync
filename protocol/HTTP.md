@@ -37,6 +37,7 @@ VaultLog DO id = `idFromName(vaultId)`. SQLite table `ops(seq INTEGER PK AUTOINC
 |--------|------|--------|
 | POST | `/v1/vaults/:vaultId/ops` | `OpsPushRequest` — verify ECDSA P-256 sig over canonical bytes; device must be in flock and not revoked; assign seq |
 | GET | `/v1/vaults/:vaultId/ops?after=N` | ops with seq > N, limit 200 |
+| GET | `/v1/vaults/:vaultId/wait?after=N` | `{ head }` immediately if the head differs from N, on the next append, or after 10 seconds |
 | GET | `/v1/vaults/:vaultId/merkle` | `MerkleResponse` live tips (latest non-tombstone per path_cipher; tombstone wins if latest) |
 | PUT | `/v1/vaults/:vaultId/blobs/:blobHash` | raw body ciphertext, max 25MB, `Content-Type: application/octet-stream`. R2 key `{flockId}/{vaultId}/{blobHash}` |
 | GET | `/v1/vaults/:vaultId/blobs/:blobHash` | ciphertext bytes |
