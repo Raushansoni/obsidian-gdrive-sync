@@ -9,8 +9,12 @@ export interface StatusLogEntry {
 export interface PathTip {
   hash: string | null;
   vv: Record<string, number>;
+  /** HLC of the acknowledged op for deterministic concurrent conflict tie-breaking. */
+  hlc?: string;
   /** Previous content of an acknowledged version, when available for a three-way merge. */
   prevHash?: string;
+  /** Bounded recent ancestor content hashes (newest first) for multi-hop 3-way merges. */
+  prevHashes?: string[];
   /** Incoming knowledge retained with local bytes; publish even if the hash is unchanged. */
   pending?: boolean;
   /** Pending local bytes already incorporate the acknowledged remote hash. */
@@ -100,19 +104,29 @@ function isCursor(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
+const MAX_PREV_HASHES = 8;
+
+function isPrevHashes(value: unknown): value is string[] {
+  return Array.isArray(value) && value.length <= MAX_PREV_HASHES && value.every((h) => isHash(h));
+}
+
 function readPathTips(raw: unknown): Record<string, PathTip> | null {
   if (!isRecord(raw)) return null;
   const entries: Array<[string, PathTip]> = [];
   for (const [path, tip] of Object.entries(raw)) {
     if (!isSyncPath(path) || !isRecord(tip) ||
       !(tip.hash === null || isHash(tip.hash)) || !isVersionVector(tip.vv) ||
+      (tip.hlc !== undefined && !isHlc(tip.hlc)) ||
       (tip.pending !== undefined && typeof tip.pending !== "boolean") ||
       (tip.pendingMerge !== undefined && (tip.pendingMerge !== true || tip.pending !== true || tip.hash === null)) ||
-      (tip.prevHash !== undefined && !isHash(tip.prevHash))) return null;
+      (tip.prevHash !== undefined && !isHash(tip.prevHash)) ||
+      (tip.prevHashes !== undefined && !isPrevHashes(tip.prevHashes))) return null;
     entries.push([path, {
       hash: tip.hash,
       vv: { ...tip.vv },
+      ...(typeof tip.hlc === "string" ? { hlc: tip.hlc } : {}),
       ...(typeof tip.prevHash === "string" ? { prevHash: tip.prevHash } : {}),
+      ...(Array.isArray(tip.prevHashes) && tip.prevHashes.length ? { prevHashes: [...tip.prevHashes] } : {}),
       ...(tip.pending === true ? { pending: true } : {}),
       ...(tip.pendingMerge === true ? { pendingMerge: true } : {}),
     }]);

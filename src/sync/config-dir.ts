@@ -21,11 +21,15 @@ const ALLOWED_ROOT_FILES = new Set([
 /** Whole subtrees that are safe to sync. */
 const ALLOWED_SUBDIRS = ["snippets", "themes", "plugins"];
 
-/** This plugin's own data.json must never be synced (would echo settings). */
-const SELF_PLUGIN_DATA_REL = "plugins/obsidian-gdrive-sync/data.json";
+/** This plugin's own folder (settings + runtime bundle) must never be synced. */
+const SELF_PLUGIN_PREFIX = "plugins/obsidian-gdrive-sync";
 
 /** Obsidian's ephemeral state — denied even though it is not in the allow-list. */
 const DENIED_PREFIXES = ["cache", "trash"];
+
+/** Volatile filenames/extensions inside plugins that cause cross-device churn. */
+const VOLATILE_BASENAME_RE = /^(?:\.ds_store|thumbs\.db|desktop\.ini)$/i;
+const VOLATILE_EXT_RE = /\.(?:log|tmp|bak|lock|sqlite|sqlite-wal|sqlite-shm|db-wal|db-shm)$/i;
 
 /**
  * True when a vault-relative path may be synced as a config file.
@@ -46,11 +50,19 @@ export function isConfigPathAllowed(path: string, configDir: string): boolean {
   for (const denied of DENIED_PREFIXES) {
     if (relLower === denied || relLower.startsWith(denied + "/")) return false;
   }
-  if (relLower === SELF_PLUGIN_DATA_REL) return false;
+  if (relLower === SELF_PLUGIN_PREFIX || relLower.startsWith(SELF_PLUGIN_PREFIX + "/")) return false;
+
+  const segments = relLower.split("/");
+  const fileName = segments[segments.length - 1];
+  if (VOLATILE_BASENAME_RE.test(fileName) || VOLATILE_EXT_RE.test(fileName)) return false;
+  // Deny nested cache/trash directories inside third-party plugins.
+  if (segments.length >= 3 && (segments.includes("cache") || segments.includes("trash"))) {
+    return false;
+  }
 
   // Allow-list.
   if (ALLOWED_ROOT_FILES.has(rel)) return true;
-  const top = rel.indexOf("/") === -1 ? rel : rel.slice(0, rel.indexOf("/"));
+  const top = segments[0];
   if (ALLOWED_SUBDIRS.includes(top)) return true;
   return false;
 }

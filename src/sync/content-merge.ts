@@ -8,8 +8,8 @@ const encoder = new TextEncoder();
 export function mergeContent(
   path: string, base: Uint8Array, local: Uint8Array, remote: Uint8Array
 ): Uint8Array | null {
-  const extension = /\.(md|canvas)$/i.exec(path)?.[1].toLowerCase();
-  if (extension !== "md" && extension !== "canvas") return null;
+  const extension = /\.(md|canvas|json)$/i.exec(path)?.[1].toLowerCase();
+  if (extension !== "md" && extension !== "canvas" && extension !== "json") return null;
   if (Math.max(base.length, local.length, remote.length) > MAX_CONTENT_BYTES) return null;
   try {
     const original = decoder.decode(base);
@@ -17,7 +17,9 @@ export function mergeContent(
     const right = decoder.decode(remote);
     const merged = extension === "md"
       ? mergeMarkdown(original, left, right)
-      : mergeCanvas(original, left, right);
+      : extension === "canvas"
+        ? mergeCanvas(original, left, right)
+        : mergeJson(original, left, right);
     return merged === null ? null : encoder.encode(merged);
   } catch {
     return null;
@@ -30,8 +32,34 @@ interface LineEdit {
   lines: string[];
 }
 
-function linesOf(text: string): string[] {
-  return text.match(/[^\r\n]*(?:\r\n|\n|\r)|[^\r\n]+$/g) ?? [];
+interface NormalizedLines {
+  lines: string[];
+  trailingNewline: boolean;
+}
+
+function normalizeEol(text: string): string {
+  return text.replace(/\r\n?/g, "\n");
+}
+
+function detectEol(base: string, left: string, right: string): "\r\n" | "\n" {
+  const crlfCount = (s: string) => (s.match(/\r\n/g) ?? []).length;
+  const lfOnlyCount = (s: string) => (s.match(/(?<!\r)\n/g) ?? []).length;
+  const baseCrlf = crlfCount(base);
+  const baseLf = lfOnlyCount(base);
+  if (baseCrlf > 0 || baseLf > 0) return baseCrlf >= baseLf ? "\r\n" : "\n";
+  return crlfCount(left) > 0 && crlfCount(right) > 0 ? "\r\n" : "\n";
+}
+
+function splitNormalized(text: string): NormalizedLines {
+  if (!text) return { lines: [], trailingNewline: false };
+  const trailingNewline = text.endsWith("\n");
+  const body = trailingNewline ? text.slice(0, -1) : text;
+  return { lines: body.split("\n"), trailingNewline };
+}
+
+function joinLines(lines: string[], trailingNewline: boolean, eol: "\r\n" | "\n"): string {
+  if (!lines.length) return trailingNewline ? eol : "";
+  return lines.join(eol) + (trailingNewline ? eol : "");
 }
 
 function sameList<T>(left: T[], right: T[]): boolean {
@@ -96,26 +124,76 @@ function lineEdits(base: string[], changed: string[]): LineEdit[] | null {
 function mergeMarkdown(base: string, left: string, right: string): string | null {
   if (left === right || right === base) return left;
   if (left === base) return right;
-  const original = linesOf(base);
-  const leftEdits = lineEdits(original, linesOf(left));
-  const rightEdits = lineEdits(original, linesOf(right));
+
+  const eol = detectEol(base, left, right);
+  const normBase = normalizeEol(base);
+  const normLeft = normalizeEol(left);
+  const normRight = normalizeEol(right);
+
+  // Pure line-ending differences across platforms (Windows CRLF vs Android/macOS LF)
+  // are never real content conflicts.
+  if (normLeft === normRight || normRight === normBase) {
+    const parsed = splitNormalized(normLeft);
+    return joinLines(parsed.lines, parsed.trailingNewline, eol);
+  }
+  if (normLeft === normBase) {
+    const parsed = splitNormalized(normRight);
+    return joinLines(parsed.lines, parsed.trailingNewline, eol);
+  }
+
+  const baseParsed = splitNormalized(normBase);
+  const leftParsed = splitNormalized(normLeft);
+  const rightParsed = splitNormalized(normRight);
+  const original = baseParsed.lines;
+
+  const leftEdits = lineEdits(original, leftParsed.lines);
+  const rightEdits = lineEdits(original, rightParsed.lines);
   if (!leftEdits || !rightEdits) return null;
+
   const edits = [...leftEdits, ...rightEdits].sort((a, b) => a.start - b.start || a.end - b.end);
-  const result: string[] = [];
+  const mergedLines: string[] = [];
   let cursor = 0;
-  let previous: LineEdit | undefined;
-  for (const edit of edits) {
-    if (previous?.start === edit.start && previous.end === edit.end) {
-      if (!sameList(previous.lines, edit.lines)) return null;
-      continue;
+  for (let i = 0; i < edits.length; i++) {
+    const edit = edits[i];
+    // Coalesce identical-span edits from both sides.
+    if (i + 1 < edits.length && edits[i + 1].start === edit.start && edits[i + 1].end === edit.end) {
+      const next = edits[i + 1];
+      if (sameList(edit.lines, next.lines)) {
+        i++;
+      } else if (edit.start === edit.end && edit.start === original.length && original.length > 0) {
+        // Pure concurrent appends at EOF (e.g. Daily Notes, bullet lists, logs):
+        // combine both blocks in a deterministic canonical order so every device
+        // converges identically without creating a conflict file.
+        if (edit.start < cursor) return null;
+        const firstText = edit.lines.join("\n");
+        const secondText = next.lines.join("\n");
+        const ordered = firstText <= secondText
+          ? [...edit.lines, ...next.lines]
+          : [...next.lines, ...edit.lines];
+        mergedLines.push(...original.slice(cursor, edit.start), ...ordered);
+        cursor = edit.end;
+        i++;
+        continue;
+      } else {
+        return null;
+      }
     }
     if (edit.start < cursor) return null;
-    result.push(original.slice(cursor, edit.start).join(""), edit.lines.join(""));
+    mergedLines.push(...original.slice(cursor, edit.start), ...edit.lines);
     cursor = edit.end;
-    previous = edit;
   }
-  result.push(original.slice(cursor).join(""));
-  return result.join("");
+  mergedLines.push(...original.slice(cursor));
+
+  const trailingNewline =
+    leftParsed.trailingNewline === rightParsed.trailingNewline
+      ? leftParsed.trailingNewline
+      : leftParsed.trailingNewline === baseParsed.trailingNewline
+        ? rightParsed.trailingNewline
+        : rightParsed.trailingNewline === baseParsed.trailingNewline
+          ? leftParsed.trailingNewline
+          : true;
+
+  return joinLines(mergedLines, trailingNewline, eol);
 }
 
 type Json = string | number | boolean | null | Json[] | JsonObject;
@@ -126,15 +204,23 @@ function isObject(value: Json | undefined): value is JsonObject {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function isPrimitive(value: Json): value is string | number | boolean | null {
+  return value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean";
+}
+
 function property(value: JsonObject, key: string): Json | undefined {
   return Object.prototype.hasOwnProperty.call(value, key) ? value[key] : undefined;
 }
 
-function parseCanvas(text: string): JsonObject {
-  const value: Json = JSON.parse(text.replace(/^\uFEFF/, ""), (_key, item) => {
-    if (typeof item === "number" && !Number.isFinite(item)) throw new Error("Invalid Canvas number");
+function parseJsonStrict(text: string): Json {
+  return JSON.parse(text.replace(/^\uFEFF/, ""), (_key, item) => {
+    if (typeof item === "number" && !Number.isFinite(item)) throw new Error("Invalid JSON number");
     return item;
-  });
+  }) as Json;
+}
+
+function parseCanvas(text: string): JsonObject {
+  const value = parseJsonStrict(text);
   if (!isObject(value)) throw new Error("Invalid Canvas object");
   return value;
 }
@@ -153,6 +239,101 @@ function mergeValue(base: Json | undefined, left: Json | undefined, right: Json 
   if (equalJson(left, right) || equalJson(right, base)) return left;
   if (equalJson(left, base)) return right;
   return CONFLICT;
+}
+
+function uniquePrimitiveKeys(arr: Json[]): string[] | null {
+  const keys: string[] = [];
+  const seen = new Set<string>();
+  for (const item of arr) {
+    if (!isPrimitive(item)) return null;
+    const key = `${typeof item}:${String(item)}`;
+    if (seen.has(key)) return null;
+    seen.add(key);
+    keys.push(key);
+  }
+  return keys;
+}
+
+function mergePrimitiveArray(base: Json[], left: Json[], right: Json[]): Json[] | typeof CONFLICT {
+  const baseKeys = uniquePrimitiveKeys(base);
+  const leftKeys = uniquePrimitiveKeys(left);
+  const rightKeys = uniquePrimitiveKeys(right);
+  if (!baseKeys || !leftKeys || !rightKeys) return CONFLICT;
+
+  const baseSet = new Set(baseKeys);
+  const leftSet = new Set(leftKeys);
+  const rightSet = new Set(rightKeys);
+
+  const byKey = new Map<string, Json>();
+  baseKeys.forEach((k, i) => byKey.set(k, base[i]));
+  leftKeys.forEach((k, i) => byKey.set(k, left[i]));
+  rightKeys.forEach((k, i) => byKey.set(k, right[i]));
+
+  // Keep surviving base elements in original order (deleted on either side -> removed).
+  const out: Json[] = [];
+  const emitted = new Set<string>();
+  for (let i = 0; i < baseKeys.length; i++) {
+    const key = baseKeys[i];
+    if (leftSet.has(key) && rightSet.has(key)) {
+      out.push(base[i]);
+      emitted.add(key);
+    }
+  }
+  // Deterministically append newly added items from both sides.
+  const added = [...new Set([
+    ...leftKeys.filter((k) => !baseSet.has(k)),
+    ...rightKeys.filter((k) => !baseSet.has(k)),
+  ])].sort();
+  for (const key of added) {
+    if (emitted.has(key)) continue;
+    emitted.add(key);
+    out.push(byKey.get(key)!);
+  }
+  return out;
+}
+
+function mergeJsonDeep(
+  base: Json | undefined, left: Json | undefined, right: Json | undefined
+): Json | undefined | typeof CONFLICT {
+  const direct = mergeValue(base, left, right);
+  if (direct !== CONFLICT) return direct;
+  if (isObject(left) && isObject(right) && (base === undefined || isObject(base))) {
+    const baseObj = base ?? {};
+    const baseKeys = Object.keys(baseObj);
+    const additions = [...new Set([...Object.keys(left), ...Object.keys(right)])]
+      .filter((key) => property(baseObj, key) === undefined).sort();
+    const entries: [string, Json][] = [];
+    for (const key of [...baseKeys, ...additions]) {
+      const merged = mergeJsonDeep(property(baseObj, key), property(left, key), property(right, key));
+      if (merged === CONFLICT) return CONFLICT;
+      if (merged !== undefined) entries.push([key, merged]);
+    }
+    return Object.fromEntries(entries);
+  }
+  if (Array.isArray(base) && Array.isArray(left) && Array.isArray(right)) {
+    return mergePrimitiveArray(base, left, right);
+  }
+  return CONFLICT;
+}
+
+function detectJsonIndent(text: string): string | number | undefined {
+  const match = /\n([ \t]+)"/.exec(text);
+  return match ? match[1] : undefined;
+}
+
+function mergeJson(base: string, left: string, right: string): string | null {
+  if (left === right || right === base) return left;
+  if (left === base) return right;
+  const baseVal = parseJsonStrict(base);
+  const leftVal = parseJsonStrict(left);
+  const rightVal = parseJsonStrict(right);
+  const merged = mergeJsonDeep(baseVal, leftVal, rightVal);
+  if (merged === CONFLICT || merged === undefined) return null;
+  const indent = detectJsonIndent(base) ?? 2;
+  const trailingNewline = base.endsWith("\n") || left.endsWith("\n") || right.endsWith("\n");
+  const eol = detectEol(base, left, right);
+  const serialized = JSON.stringify(merged, null, indent).replace(/\n/g, eol);
+  return trailingNewline ? serialized + eol : serialized;
 }
 
 function mergeFields(base: JsonObject, left: JsonObject, right: JsonObject, skip = new Set<string>()): JsonObject {

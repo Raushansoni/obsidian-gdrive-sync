@@ -20,6 +20,15 @@ export function parseHlc(s: string): Hlc {
   };
 }
 
+/** Total order over HLC strings: wall, then logical count, then deviceId. */
+export function compareHlc(a: string, b: string): number {
+  const ha = parseHlc(a);
+  const hb = parseHlc(b);
+  if (ha.wall !== hb.wall) return ha.wall - hb.wall;
+  if (ha.count !== hb.count) return ha.count - hb.count;
+  return ha.deviceId < hb.deviceId ? -1 : ha.deviceId > hb.deviceId ? 1 : 0;
+}
+
 export function tickHlc(prev: Hlc | null, deviceId: string, now = Date.now()): Hlc {
   if (!prev) return { wall: now, count: 0, deviceId };
   if (now > prev.wall) return { wall: now, count: 0, deviceId };

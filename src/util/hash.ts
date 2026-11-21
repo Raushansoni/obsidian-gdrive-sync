@@ -1,18 +1,24 @@
 /** SHA-256 hex digest — works on desktop and mobile via Web Crypto. */
 export async function sha256Hex(data: ArrayBuffer | Uint8Array | string): Promise<string> {
-  let bytes: Uint8Array;
+  let ab: ArrayBuffer;
   if (typeof data === "string") {
-    bytes = new TextEncoder().encode(data);
-  } else if (data instanceof Uint8Array) {
-    bytes = data;
+    const encoded = new TextEncoder().encode(data);
+    ab = encoded.buffer;
+  } else if (data instanceof ArrayBuffer) {
+    ab = data;
+  } else if (
+    data.buffer instanceof ArrayBuffer &&
+    data.byteOffset === 0 &&
+    data.byteLength === data.buffer.byteLength
+  ) {
+    ab = data.buffer;
   } else {
-    bytes = new Uint8Array(data);
+    const copy = new Uint8Array(data.byteLength);
+    copy.set(data);
+    ab = copy.buffer;
   }
 
-  // Ensure we pass an ArrayBuffer-backed view for crypto.subtle
-  const copy = new Uint8Array(bytes.byteLength);
-  copy.set(bytes);
-  const digest = await crypto.subtle.digest("SHA-256", copy.buffer);
+  const digest = await crypto.subtle.digest("SHA-256", ab);
   return Array.from(new Uint8Array(digest))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");

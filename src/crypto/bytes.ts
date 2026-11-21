@@ -1,7 +1,13 @@
+const B64_CHUNK = 0x2000;
+
 export function bytesToB64(bytes: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-  return btoa(s);
+  if (bytes.length === 0) return "";
+  const chunks: string[] = [];
+  for (let i = 0; i < bytes.length; i += B64_CHUNK) {
+    const slice = bytes.subarray(i, Math.min(i + B64_CHUNK, bytes.length));
+    chunks.push(String.fromCharCode.apply(null, slice as unknown as number[]));
+  }
+  return btoa(chunks.join(""));
 }
 
 export function b64ToBytes(b64: string): Uint8Array {
@@ -53,8 +59,15 @@ export function fromUtf8(b: Uint8Array): string {
   return new TextDecoder().decode(b);
 }
 
-/** Fresh ArrayBuffer copy — WebCrypto BufferSource rejects SharedArrayBuffer views. */
+/** ArrayBuffer view safe for WebCrypto — avoids copying when already a full ArrayBuffer. */
 export function asAb(bytes: Uint8Array): ArrayBuffer {
+  if (
+    bytes.buffer instanceof ArrayBuffer &&
+    bytes.byteOffset === 0 &&
+    bytes.byteLength === bytes.buffer.byteLength
+  ) {
+    return bytes.buffer;
+  }
   const copy = new Uint8Array(bytes.byteLength);
   copy.set(bytes);
   return copy.buffer;

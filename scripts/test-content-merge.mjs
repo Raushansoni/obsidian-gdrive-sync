@@ -92,3 +92,64 @@ test("Canvas composes compatible concurrent stacking order edits and rejects cyc
     [b, a, d, c]);
   assert.equal(merge("Board.canvas", base, board([b, a, c, d]), board([a, c, b, d])), null);
 });
+
+test("Markdown merges mixed CRLF/LF edits across Windows and mobile without false conflicts", () => {
+  const base = "Heading\r\nLine 1\r\nLine 2\r\nLine 3\r\n";
+  const windowsEdit = "Heading\r\nLine 1 Windows\r\nLine 2\r\nLine 3\r\n";
+  const mobileEdit = "Heading\nLine 1\nLine 2\nLine 3 Mobile\n";
+  const expected = "Heading\r\nLine 1 Windows\r\nLine 2\r\nLine 3 Mobile\r\n";
+  assert.equal(merge("Note.md", base, windowsEdit, mobileEdit), expected);
+  assert.equal(merge("Note.md", base, mobileEdit, windowsEdit), expected);
+});
+
+test("Markdown merges last-line edit with EOF append even without trailing newline", () => {
+  const base = "# Daily\n- item 1";
+  const editLast = "# Daily\n- item 1 edited";
+  const appendNext = "# Daily\n- item 1\n- item 2";
+  const expected = "# Daily\n- item 1 edited\n- item 2";
+  assert.equal(merge("Daily.md", base, editLast, appendNext), expected);
+  assert.equal(merge("Daily.md", base, appendNext, editLast), expected);
+});
+
+test("Markdown deterministically combines concurrent EOF appends on daily notes", () => {
+  const base = "# Daily\n- morning\n";
+  const phone = "# Daily\n- morning\n- call mom\n";
+  const desktop = "# Daily\n- morning\n- buy milk\n";
+  const expected = "# Daily\n- morning\n- buy milk\n- call mom\n";
+  assert.equal(merge("Daily.md", base, phone, desktop), expected);
+  assert.equal(merge("Daily.md", base, desktop, phone), expected);
+});
+
+test("JSON config merge combines independent keys, nested objects, and plugin arrays", () => {
+  const base = JSON.stringify({ theme: "obsidian", vimMode: false, nested: { a: 1, b: 2 } }, null, 2) + "\n";
+  const left = JSON.stringify({ theme: "moonstone", vimMode: false, nested: { a: 10, b: 2 } }, null, 2) + "\n";
+  const right = JSON.stringify({ theme: "obsidian", vimMode: true, nested: { a: 1, b: 20 }, extra: "ok" }, null, 2) + "\n";
+  const ab = merge(".obsidian/app.json", base, left, right);
+  const ba = merge(".obsidian/app.json", base, right, left);
+  assert.equal(ab, ba);
+  assert.deepEqual(JSON.parse(ab), {
+    theme: "moonstone",
+    vimMode: true,
+    nested: { a: 10, b: 20 },
+    extra: "ok",
+  });
+
+  // Plugin list array 3-way set merge (community-plugins.json)
+  const pluginsBase = JSON.stringify(["dataview", "templater"], null, 2) + "\n";
+  const pluginsLeft = JSON.stringify(["dataview", "templater", "calendar"], null, 2) + "\n";
+  const pluginsRight = JSON.stringify(["dataview", "kanban"], null, 2) + "\n";
+  const mergedPlugins = merge(".obsidian/community-plugins.json", pluginsBase, pluginsLeft, pluginsRight);
+  assert.equal(mergedPlugins, merge(".obsidian/community-plugins.json", pluginsBase, pluginsRight, pluginsLeft));
+  assert.deepEqual(JSON.parse(mergedPlugins), ["dataview", "calendar", "kanban"]);
+
+  // Same scalar key modified differently still reports conflict (null)
+  assert.equal(
+    merge(
+      ".obsidian/app.json",
+      '{"theme":"obsidian"}',
+      '{"theme":"light"}',
+      '{"theme":"dark"}'
+    ),
+    null
+  );
+});

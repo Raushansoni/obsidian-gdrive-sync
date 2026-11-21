@@ -14,12 +14,5 @@
     "lib": ["DOM", "ES2020"],
     "types": ["node"]
   },
-  "include": ["src/**/*.ts"],
-  "exclude": [
-    "src/sync/sync-engine.ts",
-    "src/sync/index-store.ts",
-    "src/auth/**",
-    "src/drive/**",
-    "src/bundled-oauth.ts"
-  ]
+  "include": ["src/**/*.ts"]
 }

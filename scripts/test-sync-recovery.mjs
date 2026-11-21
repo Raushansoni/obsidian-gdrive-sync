@@ -215,7 +215,10 @@ async function device(relay, initial = {}, stored = {}) {
   let lastStatusChange = performance.now();
   const snapshots = [];
 
+  let saveCount = 0;
+
   async function saveData() {
+    saveCount++;
     // Match src/main.ts savePluginData: REPLACE the live object before persistence.
     liveData = production.sanitizePluginData(liveData);
     persisted = structuredClone(liveData);
@@ -269,6 +272,7 @@ async function device(relay, initial = {}, stored = {}) {
     snapshots,
     get status() { return status; },
     get relayUrl() { return liveData.relayUrl; },
+    get saveCount() { return saveCount; },
     async setRelayUrl(value) {
       const url = value.trim() || production.DEFAULT_DATA.relayUrl;
       liveData.relayUrl = url;
@@ -988,6 +992,132 @@ test("review-config-same-stat: same-session config edit with unchanged mtime and
   await reader.sync();
   equal(writer.vault.text(configPath), '{"mode":"new"}\n', "Same-stat edit L remains on local disk");
   equal(reader.vault.text(configPath), '{"mode":"new"}\n', "A warm stat cache cannot suppress the real same-stat config change L");
+});
+
+// Root-cause regression: two devices pushing unmergeable edits concurrently must converge to ONE conflict file with zero ping-pong.
+test("rootcause-no-conflict-pingpong: concurrent unmergeable pushes converge to one conflict copy without looping", async () => {
+  const relay = await new TestRelay().init();
+  const desktop = await device(relay, { "Shared.md": "original line\n" });
+  await desktop.sync();
+  const phone = await device(relay);
+  await phone.sync();
+
+  desktop.vault.edit("Shared.md", "desktop conflicting rewrite\n");
+  phone.vault.edit("Shared.md", "phone conflicting rewrite\n");
+
+  // Simulate true concurrent push: phone pushes while desktop's push is in flight.
+  relay.beforePush = async () => {
+    await phone.sync({ full: false });
+  };
+  await desktop.sync({ full: false });
+  await phone.sync({ full: false });
+  await desktop.sync({ full: false });
+  await phone.sync({ full: false });
+
+  const opsAfterConverge = relay.ops.length;
+  // Additional sync rounds must not emit ping-pong ops or extra conflict copies.
+  await desktop.sync({ full: false });
+  await phone.sync({ full: false });
+  equal(relay.ops.length, opsAfterConverge, "Converged conflict must not ping-pong extra ops");
+
+  const desktopFiles = desktop.vault.getFiles().map((f) => [f.path, desktop.vault.text(f.path)]).sort();
+  const phoneFiles = phone.vault.getFiles().map((f) => [f.path, phone.vault.text(f.path)]).sort();
+  equal(desktopFiles, phoneFiles, "Both devices converge to the exact same canonical note and single conflict file");
+  equal(desktopFiles.length, 2, "Only the original note and ONE conflict sibling exist (not two duplicates)");
+  const contents = desktopFiles.map(([, text]) => text);
+  ok(contents.includes("desktop conflicting rewrite\n") && contents.includes("phone conflicting rewrite\n"),
+    "Both conflicting versions survive without loss");
+});
+
+// Root-cause regression: multiple consecutive pushes on device A + concurrent edit from original base on device B still 3-way merge.
+test("rootcause-multihop-merge: multi-edit lineage still finds common ancestor without creating a conflict", async () => {
+  const relay = await new TestRelay().init();
+  const desktop = await device(relay, { "Multi.md": "Top.\n\nMiddle.\n\nBottom.\n" });
+  await desktop.sync();
+  const phone = await device(relay);
+  await phone.sync();
+
+  // Desktop pushes 3 consecutive edits while phone is offline.
+  desktop.vault.edit("Multi.md", "Top v1.\n\nMiddle.\n\nBottom.\n");
+  await desktop.sync({ full: false });
+  desktop.vault.edit("Multi.md", "Top v2.\n\nMiddle.\n\nBottom.\n");
+  await desktop.sync({ full: false });
+  desktop.vault.edit("Multi.md", "Top v3.\n\nMiddle v3.\n\nBottom.\n");
+  await desktop.sync({ full: false });
+
+  // Phone edits Bottom from the original base, then pushes concurrently (or syncs).
+  phone.vault.edit("Multi.md", "Top.\n\nMiddle.\n\nBottom from phone.\n");
+  await phone.sync({ full: false });
+  await desktop.sync({ full: false });
+  await phone.sync({ full: false });
+
+  const expected = "Top v3.\n\nMiddle v3.\n\nBottom from phone.\n";
+  for (const endpoint of [desktop, phone]) {
+    equal(endpoint.vault.text("Multi.md"), expected, "Multi-hop ancestor merge preserves all edits from both devices");
+    equal(endpoint.vault.getFiles().map(({ path }) => path), ["Multi.md"], "Multi-hop merge creates zero conflict files");
+  }
+});
+
+// Root-cause regression: concurrent .obsidian JSON config edits merge cleanly instead of creating Flock conflicts/*.json.
+test("rootcause-config-json-merge: concurrent config JSON edits merge without Flock conflicts files", async () => {
+  const relay = await new TestRelay().init();
+  const configPath = ".obsidian/app.json";
+  const desktop = await device(relay, {
+    [configPath]: JSON.stringify({ vimMode: false, spellcheck: false }, null, 2) + "\n",
+  });
+  await desktop.sync();
+  const phone = await device(relay);
+  await phone.sync();
+
+  desktop.vault.store(configPath, JSON.stringify({ vimMode: true, spellcheck: false }, null, 2) + "\n");
+  phone.vault.store(configPath, JSON.stringify({ vimMode: false, spellcheck: true }, null, 2) + "\n");
+
+  await phone.sync();
+  await desktop.sync();
+  await phone.sync();
+
+  for (const endpoint of [desktop, phone]) {
+    equal(JSON.parse(endpoint.vault.text(configPath)), { vimMode: true, spellcheck: true },
+      "Independent JSON config keys merge cleanly across devices");
+    equal(endpoint.vault.getFiles().map(({ path }) => path), [], "No Flock conflicts/*.json files are created");
+  }
+});
+
+// Root-cause regression: mixed CRLF (Windows) and LF (mobile) concurrent edits merge with zero conflict files.
+test("rootcause-crossplatform-eol-merge: CRLF and LF edits merge cleanly across devices", async () => {
+  const relay = await new TestRelay().init();
+  const desktop = await device(relay, { "CrossPlatform.md": "Title\r\nAlpha\r\nBeta\r\nGamma\r\n" });
+  await desktop.sync();
+  const phone = await device(relay);
+  await phone.sync();
+
+  desktop.vault.edit("CrossPlatform.md", "Title\r\nAlpha desktop\r\nBeta\r\nGamma\r\n");
+  phone.vault.edit("CrossPlatform.md", "Title\nAlpha\nBeta\nGamma phone\n");
+
+  await phone.sync({ full: false });
+  await desktop.sync({ full: false });
+  await phone.sync({ full: false });
+
+  const expected = "Title\r\nAlpha desktop\r\nBeta\r\nGamma phone\r\n";
+  for (const endpoint of [desktop, phone]) {
+    equal(endpoint.vault.text("CrossPlatform.md"), expected, "Mixed EOL edits merge cleanly");
+    equal(endpoint.vault.getFiles().map(({ path }) => path), ["CrossPlatform.md"], "Mixed EOL creates zero conflict files");
+  }
+});
+
+// Root-cause regression: idle sync skips redundant data.json writes and remote writes do not trigger echo pushes.
+test("rootcause-idle-zero-save: idle sync does not thrash saveData and remote writes emit no echo ops", async () => {
+  const relay = await new TestRelay().init();
+  await relay.remote("Quiet.md", "initial content\n");
+  const local = await device(relay);
+  await local.sync();
+  const savesAfterFirst = local.saveCount;
+  const opsAfterFirst = relay.ops.length;
+
+  await local.sync({ full: false });
+  await local.sync({ full: false });
+  equal(local.saveCount, savesAfterFirst, "Idle incremental sync must not rewrite data.json");
+  equal(relay.ops.length, opsAfterFirst, "Remote writes must not trigger echo ops");
 });
 
 try {

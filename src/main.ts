@@ -111,13 +111,14 @@ export default class FlockSyncPlugin extends Plugin {
 
     this.app.workspace.onLayoutReady(() => {
       if (this.autoSyncStopped) return;
-      if (this.data.autoSync && this.identity.hasFlock() && this.data.enrolled) void this.syncNow(false);
+      if (this.data.autoSync && this.identity.hasFlock() && this.data.enrolled) void this.engine?.sync({ full: false });
       this.restartAutoSync();
     });
 
     this.registerDomEvent(document, "visibilitychange", () => {
       if (document.visibilityState === "visible" && this.data.autoSync && this.identity.hasFlock() && this.data.enrolled) {
-        void this.syncNow(false);
+        // Incremental catch-up on window focus; the 5-minute full-scan timer still runs periodically.
+        void this.engine?.sync({ full: false });
       }
       this.restartAutoSync();
     });
@@ -205,8 +206,18 @@ export default class FlockSyncPlugin extends Plugin {
     }
     if (!this.canAutoSync()) return;
     const ms = Math.max(15, this.data.syncIntervalSeconds) * 1000;
+    let lastFallbackPoll = Date.now();
     this.pollTimer = setInterval(() => {
-      void this.engine?.sync({ full: false });
+      const now = Date.now();
+      // When the live long-poll listener is actively connected on a visible desktop,
+      // skip redundant 20s idle pulls unless there is local work or 60s elapsed for config checks.
+      const fallbackDue = !this.listeningForRelay ||
+        (this.engine?.hasPendingLocalWork() ?? false) ||
+        now - lastFallbackPoll >= Math.max(60_000, ms);
+      if (fallbackDue) {
+        lastFallbackPoll = now;
+        void this.engine?.sync({ full: false });
+      }
       if (!this.relayRetryTimer) void this.listenForRelay();
     }, ms);
     void this.listenForRelay();

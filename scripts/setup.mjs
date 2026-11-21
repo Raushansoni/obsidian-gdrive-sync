@@ -112,6 +112,7 @@ const FLOCK_KEYS = [
   "statusLog",
   "localCursor",
   "pathTips",
+  "relayState",
   "lastHlc",
 ];
 
@@ -145,6 +146,7 @@ function toFlockData(parsed, relayUrl) {
     statusLog: legacy ? [] : Array.isArray(src.statusLog) ? src.statusLog : [],
     localCursor: legacy ? 0 : typeof src.localCursor === "number" ? src.localCursor : 0,
     pathTips: legacy ? {} : src.pathTips && typeof src.pathTips === "object" ? src.pathTips : {},
+    relayState: legacy ? null : src.relayState && typeof src.relayState === "object" ? src.relayState : null,
     lastHlc: legacy ? null : typeof src.lastHlc === "string" ? src.lastHlc : null,
   };
   if (!out.relayUrl) delete out.relayUrl;
