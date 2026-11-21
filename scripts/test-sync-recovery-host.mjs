@@ -39,14 +39,29 @@ export class MemoryVault {
         this.files.delete(path);
       },
       mkdir: async (path) => { this.addFolder(path); },
+      rmdir: async (path, recursive = false) => {
+        const norm = normalizePath(path);
+        const prefix = `${norm}/`;
+        const hasChildren = [...this.files.keys()].some((k) => k.startsWith(prefix)) ||
+          [...this.folders.keys()].some((k) => k.startsWith(prefix));
+        if (hasChildren && !recursive) throw new Error(`Directory not empty: ${norm}`);
+        if (recursive) {
+          for (const k of [...this.files.keys()]) if (k.startsWith(prefix)) this.files.delete(k);
+          for (const k of [...this.folders.keys()]) if (k.startsWith(prefix)) this.folders.delete(k);
+        }
+        this.folders.delete(norm);
+      },
       stat: async (path) => {
         const entry = this.files.get(path);
         if (entry) return { type: "file", ...entry.file.stat };
         return this.folders.has(path) ? { type: "folder", mtime: 0, ctime: 0, size: 0 } : null;
       },
       list: async (path) => {
-        const parent = `${path}/`;
-        const immediate = (key) => key.startsWith(parent) && !key.slice(parent.length).includes("/");
+        const norm = normalizePath(path);
+        const parent = norm ? `${norm}/` : "";
+        const immediate = (key) => parent
+          ? key.startsWith(parent) && !key.slice(parent.length).includes("/")
+          : !key.includes("/");
         return {
           files: [...this.files.keys()].filter(immediate).sort(),
           folders: [...this.folders.keys()].filter(immediate).sort(),
@@ -112,6 +127,8 @@ export class MemoryVault {
   isConfig(path) { return path === this.configDir || path.startsWith(`${this.configDir}/`); }
   getName() { return "Sync recovery test"; }
   getFiles() { return [...this.files.values()].map(({ file }) => file).filter((file) => !this.isConfig(file.path)); }
+  getAllFolders() { return [...this.folders.values()].filter((folder) => !this.isConfig(folder.path)); }
+  getAllLoadedFiles() { return [...this.getAllFolders(), ...this.getFiles()]; }
   getAbstractFileByPath(path) {
     if (this.isConfig(path)) return null; // Obsidian does not index its config directory.
     return this.files.get(path)?.file ?? this.folders.get(path) ?? null;
@@ -121,7 +138,7 @@ export class MemoryVault {
     listeners.push(listener);
     this.listeners.set(event, listeners);
   }
-  emit(event, file) { for (const listener of this.listeners.get(event) ?? []) listener(file); }
+  emit(event, ...args) { for (const listener of this.listeners.get(event) ?? []) listener(...args); }
   edit(path, content) {
     const existed = this.files.has(path);
     const file = this.store(path, content);
@@ -140,7 +157,50 @@ export class MemoryVault {
     return this.edit(path, bytes);
   }
   async modifyBinary(file, bytes) { this.maybeFail("write", file.path); this.edit(file.path, bytes); }
-  async createFolder(path) { this.addFolder(path); }
+  async createFolder(path) {
+    const norm = normalizePath(path);
+    const existed = this.folders.has(norm);
+    this.addFolder(norm);
+    const folder = this.folders.get(norm);
+    if (!existed && folder && !this.isConfig(norm)) this.emit("create", folder);
+    return folder;
+  }
+  async rename(file, newPath) {
+    const oldPath = file.path;
+    const normNew = normalizePath(newPath);
+    if (file instanceof TFolder) {
+      const oldPrefix = `${oldPath}/`;
+      const movedFolders = [...this.folders.entries()].filter(([k]) => k === oldPath || k.startsWith(oldPrefix));
+      const movedFiles = [...this.files.entries()].filter(([k]) => k.startsWith(oldPrefix));
+      for (const [k] of movedFolders) this.folders.delete(k);
+      for (const [k] of movedFiles) this.files.delete(k);
+      const slash = normNew.lastIndexOf("/");
+      if (slash >= 0) this.addFolder(normNew.slice(0, slash));
+      for (const [k, folder] of movedFolders) {
+        const target = normNew + k.slice(oldPath.length);
+        folder.path = target;
+        folder.name = target.split("/").at(-1);
+        this.folders.set(target, folder);
+      }
+      for (const [k, entry] of movedFiles) {
+        const target = normNew + k.slice(oldPath.length);
+        entry.file.path = target;
+        entry.file.name = target.split("/").at(-1);
+        this.files.set(target, entry);
+      }
+      this.emit("rename", file, oldPath);
+    } else {
+      const entry = this.files.get(oldPath);
+      if (!entry) return;
+      this.files.delete(oldPath);
+      const slash = normNew.lastIndexOf("/");
+      if (slash >= 0) this.addFolder(normNew.slice(0, slash));
+      file.path = normNew;
+      file.name = normNew.split("/").at(-1);
+      this.files.set(normNew, entry);
+      this.emit("rename", file, oldPath);
+    }
+  }
   async delete(file) {
     this.maybeFail("delete", file.path);
     this.auditMutation("delete", file.path);

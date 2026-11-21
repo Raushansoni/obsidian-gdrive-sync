@@ -247,6 +247,7 @@ async function device(relay, initial = {}, stored = {}) {
   app.vault.on("create", (file) => engine.onLocalCreateOrModify(file));
   app.vault.on("modify", (file) => engine.onLocalCreateOrModify(file));
   app.vault.on("delete", (file) => engine.onLocalDelete(file));
+  app.vault.on("rename", (file, oldPath) => engine.onLocalRename(file, oldPath));
 
   async function runAndSettle(action) {
     let timer;
@@ -1118,6 +1119,176 @@ test("rootcause-idle-zero-save: idle sync does not thrash saveData and remote wr
   await local.sync({ full: false });
   equal(local.saveCount, savesAfterFirst, "Idle incremental sync must not rewrite data.json");
   equal(relay.ops.length, opsAfterFirst, "Remote writes must not trigger echo ops");
+});
+
+// Folder sync: deleting a folder with nested files removes the folder tree on the peer.
+test("folder-delete-with-files: deleting a folder removes files and empty folders on peer", async () => {
+  const relay = await new TestRelay().init();
+  const pc = await device(relay, {
+    "Projects/OldApp/a.md": "alpha\n",
+    "Projects/OldApp/sub/b.md": "beta\n",
+    "Projects/Keep/c.md": "keep me\n",
+  });
+  const phone = await device(relay);
+  await pc.sync();
+  await phone.sync();
+  ok(phone.vault.getAbstractFileByPath("Projects/OldApp/sub"), "Phone receives nested folder");
+
+  // Delete Projects/OldApp on Phone.
+  await phone.vault.delete(phone.vault.getAbstractFileByPath("Projects/OldApp"));
+  await phone.sync({ full: false });
+  await pc.sync({ full: false });
+
+  equal(pc.vault.text("Projects/OldApp/a.md"), null, "Deleted file a.md is removed on PC");
+  equal(pc.vault.text("Projects/OldApp/sub/b.md"), null, "Deleted nested file b.md is removed on PC");
+  equal(pc.vault.getAbstractFileByPath("Projects/OldApp/sub"), null, "Deleted nested subfolder is removed on PC");
+  equal(pc.vault.getAbstractFileByPath("Projects/OldApp"), null, "Deleted folder is removed on PC");
+  equal(pc.vault.text("Projects/Keep/c.md"), "keep me\n", "Sibling folder and file stay intact");
+  ok(pc.vault.getAbstractFileByPath("Projects"), "Non-empty parent folder stays intact");
+});
+
+// Folder sync: creating, keeping, and deleting empty folders syncs both ways.
+test("folder-empty-lifecycle: empty folder create, keep-after-file-delete, and delete sync across devices", async () => {
+  const relay = await new TestRelay().init();
+  const pc = await device(relay);
+  const phone = await device(relay);
+  await pc.sync();
+  await phone.sync();
+
+  // Create an empty folder on Phone.
+  await phone.vault.createFolder("Inbox/Empty");
+  await phone.sync({ full: false });
+  await pc.sync({ full: false });
+  ok(pc.vault.getAbstractFileByPath("Inbox"), "Parent empty folder syncs to PC");
+  ok(pc.vault.getAbstractFileByPath("Inbox/Empty"), "Nested empty folder syncs to PC");
+
+  // Add a note inside Inbox/Empty, sync, then delete ONLY the note (keeping Inbox/Empty).
+  pc.vault.edit("Inbox/Empty/temp.md", "temporary\n");
+  await pc.sync({ full: false });
+  await phone.sync({ full: false });
+  equal(phone.vault.text("Inbox/Empty/temp.md"), "temporary\n", "Note reaches Phone");
+
+  await pc.vault.delete(pc.vault.getAbstractFileByPath("Inbox/Empty/temp.md"));
+  await pc.sync({ full: false });
+  await phone.sync({ full: false });
+  equal(phone.vault.text("Inbox/Empty/temp.md"), null, "Deleted note removed on Phone");
+  ok(phone.vault.getAbstractFileByPath("Inbox/Empty"), "Empty folder stays when only its file was deleted");
+
+  // Now delete the empty folder Inbox on PC.
+  await pc.vault.delete(pc.vault.getAbstractFileByPath("Inbox"));
+  await pc.sync({ full: false });
+  await phone.sync({ full: false });
+  equal(phone.vault.getAbstractFileByPath("Inbox/Empty"), null, "Empty child folder deleted on Phone");
+  equal(phone.vault.getAbstractFileByPath("Inbox"), null, "Empty parent folder deleted on Phone");
+});
+
+// Folder sync: renaming a folder (with files + empty subfolder) removes the old folder on peer.
+test("folder-rename: renaming a folder leaves no empty ghost folder behind on peer", async () => {
+  const relay = await new TestRelay().init();
+  const pc = await device(relay, { "Drafts/note.md": "hello\n" });
+  await pc.vault.createFolder("Drafts/EmptySub");
+  const phone = await device(relay);
+  await pc.sync();
+  await phone.sync();
+  ok(phone.vault.getAbstractFileByPath("Drafts/EmptySub"), "Empty subfolder synced before rename");
+
+  await pc.vault.rename(pc.vault.getAbstractFileByPath("Drafts"), "Published");
+  await pc.sync({ full: false });
+  await phone.sync({ full: false });
+
+  equal(phone.vault.text("Published/note.md"), "hello\n", "Renamed folder file arrives at new path");
+  ok(phone.vault.getAbstractFileByPath("Published/EmptySub"), "Empty subfolder arrives at new path");
+  equal(phone.vault.getAbstractFileByPath("Drafts/EmptySub"), null, "Old empty subfolder is removed");
+  equal(phone.vault.getAbstractFileByPath("Drafts"), null, "Old ghost folder is removed");
+});
+
+// Folder safety: remote folder delete must NEVER delete a folder that has concurrent local notes.
+test("folder-delete-safety: concurrent local note inside remotely deleted folder survives and converges", async () => {
+  const relay = await new TestRelay().init();
+  const pc = await device(relay, { "SharedDir/old.md": "old\n" });
+  const phone = await device(relay);
+  await pc.sync();
+  await phone.sync();
+
+  // PC deletes SharedDir while Phone concurrently adds a brand new note inside SharedDir.
+  await pc.vault.delete(pc.vault.getAbstractFileByPath("SharedDir"));
+  await pc.sync({ full: false });
+
+  phone.vault.edit("SharedDir/new-on-phone.md", "must not be lost\n");
+  await phone.sync({ full: false });
+  await pc.sync({ full: false });
+
+  equal(phone.vault.text("SharedDir/old.md"), null, "Deleted old.md is removed on Phone");
+  equal(phone.vault.text("SharedDir/new-on-phone.md"), "must not be lost\n", "New local note survives on Phone");
+  ok(phone.vault.getAbstractFileByPath("SharedDir"), "Folder stays alive on Phone for the new note");
+  equal(pc.vault.text("SharedDir/new-on-phone.md"), "must not be lost\n", "PC recreates folder and receives Phone's new note");
+  ok(pc.vault.getAbstractFileByPath("SharedDir"), "Folder converges back on PC");
+});
+
+// Legacy peer compatibility: deleting the last file without folder markers still prunes empty parents.
+test("folder-legacy-prune: remote file tombstone without folder markers prunes now-empty parent folders", async () => {
+  const relay = await new TestRelay().init();
+  const local = await device(relay);
+  await local.sync(); // Initial sync completes so subsequent pulls run incrementally.
+
+  // A legacy peer (without folder marker ops) creates a nested file, then deletes the folder/file.
+  const created = await relay.remote("Legacy/Deep/only.md", "from old client\n");
+  await local.sync({ full: false });
+  equal(local.vault.text("Legacy/Deep/only.md"), "from old client\n", "Legacy file arrives locally");
+  ok(local.vault.getAbstractFileByPath("Legacy/Deep"), "Legacy parent folder created locally");
+
+  await relay.remote("Legacy/Deep/only.md", null, { pathCipherB64: created.pathCipherB64 });
+  await local.sync({ full: false });
+  equal(local.vault.text("Legacy/Deep/only.md"), null, "Legacy deleted file is removed");
+  equal(local.vault.getAbstractFileByPath("Legacy/Deep"), null, "Empty Legacy/Deep parent is pruned");
+  equal(local.vault.getAbstractFileByPath("Legacy"), null, "Empty Legacy grandparent is pruned");
+});
+
+// Folder sync: deleting a folder externally while Obsidian is closed still syncs deletion after restart.
+test("folder-offline-delete: folder deleted outside Obsidian syncs deletion to peer after restart", async () => {
+  const relay = await new TestRelay().init();
+  const pc = await device(relay);
+  const phone = await device(relay);
+  await pc.vault.createFolder("ClosedAppDir/Sub");
+  await pc.sync();
+  await phone.sync();
+  ok(phone.vault.getAbstractFileByPath("ClosedAppDir/Sub"), "Nested empty folder synced to Phone");
+
+  // Remove folder directly from the virtual filesystem without firing Obsidian delete events.
+  pc.vault.folders.delete("ClosedAppDir/Sub");
+  pc.vault.folders.delete("ClosedAppDir");
+  pc.restart();
+  await pc.sync();
+  await phone.sync({ full: false });
+
+  equal(phone.vault.getAbstractFileByPath("ClosedAppDir/Sub"), null, "Externally deleted subfolder removed on Phone");
+  equal(phone.vault.getAbstractFileByPath("ClosedAppDir"), null, "Externally deleted folder removed on Phone");
+});
+
+// Folder safety: a folder containing an ignored/untracked file on disk is never wiped by a remote delete.
+test("folder-ignored-file-safety: remote folder delete refuses to erase a folder with an ignored local file", async () => {
+  const relay = await new TestRelay().init();
+  const pc = await device(relay, { "Archive/note.md": "synced\n" });
+  const phone = await device(relay, {}, { ignorePatterns: "*.local" });
+  await pc.sync();
+  await phone.sync();
+
+  // Phone has a local ignored file inside Archive/.
+  phone.vault.store("Archive/secret.local", "keep me locally\n");
+
+  // PC deletes Archive/.
+  await pc.vault.delete(pc.vault.getAbstractFileByPath("Archive"));
+  await pc.sync({ full: false });
+  await phone.sync({ full: false });
+
+  equal(phone.vault.text("Archive/note.md"), null, "Synced note is deleted on Phone");
+  equal(phone.vault.text("Archive/secret.local"), "keep me locally\n", "Ignored local file is NOT deleted");
+  ok(phone.vault.getAbstractFileByPath("Archive"), "Folder stays intact while ignored file exists on disk");
+
+  // Subsequent full syncs on Phone must NOT resurrect empty Archive/ back onto PC.
+  await phone.sync();
+  await pc.sync({ full: false });
+  equal(pc.vault.getAbstractFileByPath("Archive"), null, "Ignored local file does not resurrect ghost folder on PC");
 });
 
 try {

@@ -41,6 +41,10 @@ const MAX_BLOB_CACHE_BYTES = 16 * 1024 * 1024;
 const MAX_PREV_HASHES = 8;
 const IDLE_CHECKPOINT_INTERVAL_MS = 60 * 1000;
 const CONFLICT_SUFFIX_RE = / \(conflict [0-9a-f]{12}(?: \d+)?\)$/i;
+const FOLDER_MARKER_DIR = ".flock-folders";
+const FOLDER_MARKER_BYTES = new Uint8Array(0);
+/** SHA-256 of empty bytes — shared constant content hash for all virtual folder markers. */
+const FOLDER_MARKER_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 interface OpCtx {
   vaultId: string;
@@ -159,8 +163,20 @@ export class FlockSyncEngine {
   // ------------------------------------------------------------------ watch
 
   onLocalCreateOrModify(file: TAbstractFile): void {
-    if (!(file instanceof TFile)) return;
     const path = normalizeVaultPath(file.path);
+    if (!path) return;
+    if (file instanceof TFolder) {
+      if (this.writingRemotePaths.has(path)) return;
+      if (this.isConfigPath(path) || this.shouldIgnore(path) || !isSyncPath(path)) return;
+      const marker = this.folderMarkerPath(path);
+      this.markLocalChange(marker);
+      this.pendingLocal.add(marker);
+      this.pendingDeletes.delete(marker);
+      this.explicitDeletes.delete(marker);
+      this.scheduleSync();
+      return;
+    }
+    if (!(file instanceof TFile)) return;
     if (this.writingRemotePaths.has(path)) return;
     if (this.isConfigPath(path)) return; // config files are scanned, not evented
     if (this.shouldIgnore(path)) return;
@@ -170,22 +186,38 @@ export class FlockSyncEngine {
     this.pendingLocal.add(path);
     this.pendingDeletes.delete(path);
     this.explicitDeletes.delete(path);
+    this.queueMissingAncestorFolders(path);
     this.scheduleSync();
   }
 
   onLocalDelete(file: TAbstractFile): void {
     const path = normalizeVaultPath(file.path);
-    if (this.deletingRemotePaths.has(path)) return;
+    if (!path || this.deletingRemotePaths.has(path)) return;
     if (this.isConfigPath(path)) return;
     if (this.shouldIgnore(path)) return;
     if (file instanceof TFolder) {
+      const marker = isSyncPath(path) ? this.folderMarkerPath(path) : null;
+      if (marker) {
+        this.markLocalChange(marker);
+        this.explicitDeletes.add(marker);
+        this.pendingLocal.delete(marker);
+        this.pendingDeletes.add(marker);
+      }
       // Preserve explicit intent even if a metadata rebuild is queued next.
       for (const child of Object.keys(this.io.getData().pathTips)) {
-        if (!child.startsWith(path + "/")) continue;
-        this.fileStatCache.delete(child);
+        const isDescendantFile = child.startsWith(path + "/");
+        const isDescendantMarker = marker !== null && child.startsWith(marker + "/");
+        if (!isDescendantFile && !isDescendantMarker) continue;
+        if (isDescendantFile) this.fileStatCache.delete(child);
         this.markLocalChange(child);
         this.explicitDeletes.add(child);
+        this.pendingLocal.delete(child);
         this.pendingDeletes.add(child);
+      }
+      for (const pending of [...this.pendingLocal]) {
+        if (pending.startsWith(path + "/") || (marker !== null && pending.startsWith(marker + "/"))) {
+          this.pendingLocal.delete(pending);
+        }
       }
       this.scheduleSync();
       return;
@@ -205,6 +237,51 @@ export class FlockSyncEngine {
     if (this.isConfigPath(from) || this.isConfigPath(to)) return;
     if (this.shouldIgnore(from) && this.shouldIgnore(to)) return;
     if (file instanceof TFolder) {
+      const fromMarker = from && isSyncPath(from) && !this.shouldIgnore(from) ? this.folderMarkerPath(from) : null;
+      const toMarker = to && isSyncPath(to) && !this.shouldIgnore(to) ? this.folderMarkerPath(to) : null;
+      if (fromMarker && toMarker) this.pendingRenames.push({ oldPath: fromMarker, newPath: toMarker });
+      if (fromMarker) {
+        this.markLocalChange(fromMarker);
+        this.explicitDeletes.add(fromMarker);
+        this.pendingLocal.delete(fromMarker);
+        this.pendingDeletes.add(fromMarker);
+      }
+      if (toMarker) {
+        this.markLocalChange(toMarker);
+        this.pendingLocal.add(toMarker);
+        this.pendingDeletes.delete(toMarker);
+        this.explicitDeletes.delete(toMarker);
+        this.queueMissingAncestorFolders(to);
+      }
+      // Cascade to nested subfolders (including empty nested folders).
+      for (const sub of this.listLocalFolders()) {
+        if (!sub.startsWith(to + "/")) continue;
+        const oldSub = from + sub.slice(to.length);
+        const oldSubMarker = isSyncPath(oldSub) && !this.shouldIgnore(oldSub) ? this.folderMarkerPath(oldSub) : null;
+        const newSubMarker = isSyncPath(sub) && !this.shouldIgnore(sub) ? this.folderMarkerPath(sub) : null;
+        if (oldSubMarker && newSubMarker) this.pendingRenames.push({ oldPath: oldSubMarker, newPath: newSubMarker });
+        if (oldSubMarker) {
+          this.markLocalChange(oldSubMarker);
+          this.explicitDeletes.add(oldSubMarker);
+          this.pendingLocal.delete(oldSubMarker);
+          this.pendingDeletes.add(oldSubMarker);
+        }
+        if (newSubMarker) {
+          this.markLocalChange(newSubMarker);
+          this.pendingLocal.add(newSubMarker);
+          this.pendingDeletes.delete(newSubMarker);
+          this.explicitDeletes.delete(newSubMarker);
+        }
+      }
+      if (fromMarker) {
+        for (const tipPath of Object.keys(this.io.getData().pathTips)) {
+          if (!tipPath.startsWith(fromMarker + "/")) continue;
+          this.markLocalChange(tipPath);
+          this.explicitDeletes.add(tipPath);
+          this.pendingLocal.delete(tipPath);
+          this.pendingDeletes.add(tipPath);
+        }
+      }
       // Folder rename cascades to contained files.
       for (const f of this.app.vault.getFiles()) {
         const p = normalizeVaultPath(f.path);
@@ -234,7 +311,24 @@ export class FlockSyncEngine {
     this.explicitDeletes.add(from);
     this.pendingLocal.add(to);
     this.pendingDeletes.delete(to);
+    this.queueMissingAncestorFolders(to);
     this.scheduleSync();
+  }
+
+  private queueMissingAncestorFolders(filePath: string): void {
+    let dir = dirname(filePath);
+    while (dir) {
+      if (this.isConfigPath(dir) || this.shouldIgnore(dir) || !isSyncPath(dir)) break;
+      const marker = this.folderMarkerPath(dir);
+      const tip = this.pathTip(marker);
+      if (!tip || tip.hash === null || tip.pending) {
+        this.markLocalChange(marker);
+        this.pendingLocal.add(marker);
+        this.pendingDeletes.delete(marker);
+        this.explicitDeletes.delete(marker);
+      }
+      dir = dirname(dir);
+    }
   }
 
   private scheduleSync(delayMs = WATCH_DEBOUNCE_MS): void {
@@ -720,7 +814,8 @@ export class FlockSyncEngine {
     if (decoded.length <= 1) return;
     const toFetch = new Map<string, string>();
     for (const { op, path } of decoded) {
-      if (!op.blobHash || !this.canSync(path) || this.blobCache.has(op.blobHash) || toFetch.has(op.blobHash)) {
+      if (!op.blobHash || !this.canSync(path) || this.isFolderMarkerPath(path) ||
+        this.blobCache.has(op.blobHash) || toFetch.has(op.blobHash)) {
         continue;
       }
       const tip = this.pathTip(path);
@@ -809,9 +904,24 @@ export class FlockSyncEngine {
       }
     }
     const reconciled: Record<string, PathTip> = Object.create(null);
-    for (const [path, { ops, vv }] of [...paths].sort((a, b) =>
-      a[1].ops[a[1].ops.length - 1].seq! - b[1].ops[b[1].ops.length - 1].seq!)) {
-      const op = ops[ops.length - 1];
+    const orderedPaths = [...paths].sort((a, b) => {
+      const [pathA, { ops: opsA }] = a;
+      const [pathB, { ops: opsB }] = b;
+      const aFolder = this.folderPathFromMarker(pathA);
+      const bFolder = this.folderPathFromMarker(pathB);
+      const aDelete = aFolder !== null && opsA.every((item) => item.blobHash === null);
+      const bDelete = bFolder !== null && opsB.every((item) => item.blobHash === null);
+      if (aDelete !== bDelete) return aDelete ? 1 : -1;
+      if (aDelete && bDelete) {
+        const depthDiff = pathDepth(bFolder!) - pathDepth(aFolder!);
+        if (depthDiff !== 0) return depthDiff;
+      }
+      return opsA[opsA.length - 1].seq! - opsB[opsB.length - 1].seq!;
+    });
+    for (const [path, { ops, vv }] of orderedPaths) {
+      const op = this.isFolderMarkerPath(path)
+        ? (ops.find((item) => item.blobHash !== null) ?? ops[ops.length - 1])
+        : ops[ops.length - 1];
       if (this.canSync(path) && await this.mergeRecoveryVariants(ctx, path, ops)) {
         reconciled[path] = { hash: op.blobHash, vv, pending: true, pendingMerge: true };
         this.pendingLocal.add(path);
@@ -822,7 +932,7 @@ export class FlockSyncEngine {
       // Preserve every distinct maximal live variant before acknowledging joined
       // knowledge. A concurrent tombstone cannot discard another maximal blob.
       const hashes = new Set([op.blobHash]);
-      if (this.canSync(path)) {
+      if (this.canSync(path) && !this.isFolderMarkerPath(path)) {
         for (const other of ops) {
           const hash = other.blobHash;
           if (hash === null || hashes.has(hash)) continue;
@@ -907,10 +1017,14 @@ export class FlockSyncEngine {
   }
 
   private get applicationPolicy(): string {
-    return JSON.stringify([this.configDir, this.io.getData().ignorePatterns]);
+    return JSON.stringify([this.configDir, this.io.getData().ignorePatterns, "folders-v1"]);
   }
 
   private canSync(path: string): boolean {
+    const folder = this.folderPathFromMarker(path);
+    if (folder !== null) {
+      return !this.isConfigPath(folder) && !this.shouldIgnore(folder) && isSyncPath(folder);
+    }
     return !this.shouldIgnore(path) && (!this.isConfigPath(path) || isConfigPathAllowed(path, this.configDir));
   }
 
@@ -919,6 +1033,10 @@ export class FlockSyncEngine {
     recovery: boolean, knowledge = op.versionVector
   ): Promise<PathTip | null> {
     if (!this.canSync(path)) return null;
+    const folder = this.folderPathFromMarker(path);
+    if (folder !== null) {
+      return await this.applyRemoteFolder(op, path, folder, progress, recovery, knowledge);
+    }
     const tip = this.pathTip(path);
     // Rebuild causal knowledge from this verified log, not possibly corrupt
     // tips (or tips belonging to a different relay/vault/identity context).
@@ -1015,6 +1133,91 @@ export class FlockSyncEngine {
       ...(pending ? { pending: true } : isHash(op.prevHash) ? { prevHash: op.prevHash } : {}),
       ...(prevHashes ? { prevHashes } : {}),
       ...(pendingMerge ? { pendingMerge: true } : {}),
+    };
+    this.setPathTip(path, result);
+    progress.applied++;
+    return result;
+  }
+
+  private async applyRemoteFolder(
+    op: SignedOp,
+    path: string,
+    folder: string,
+    progress: SyncProgress,
+    recovery: boolean,
+    knowledge: Record<string, number>
+  ): Promise<PathTip> {
+    const tip = this.pathTip(path);
+    const vv = mergeVv(recovery ? undefined : tip?.vv, knowledge);
+    if (!recovery && tip && ((tip.hash === op.blobHash && covers(tip.vv, op.versionVector)) ||
+      dominates(tip.vv, op.versionVector))) {
+      const known: PathTip = {
+        ...tip,
+        ...(tip.hash !== op.blobHash ? { pending: true } : {}),
+        ...(tip.hash === op.blobHash && !tip.hlc ? { hlc: op.hlc } : {}),
+      };
+      if (known.pending) this.pendingLocal.add(path);
+      this.setPathTip(path, known);
+      progress.applied++;
+      return known;
+    }
+
+    const existing = this.app.vault.getAbstractFileByPath(folder);
+    const exists = existing instanceof TFolder;
+    const localHash = exists ? FOLDER_MARKER_HASH : null;
+    let pending = false;
+    let tipHlc: string | undefined = op.hlc;
+
+    if (localHash !== op.blobHash) {
+      const unchanged = !recovery && !!tip && !tip.pending && tip.hash === localHash &&
+        dominates(op.versionVector, tip.vv);
+      if (op.blobHash === null) {
+        const canDelete = unchanged || (recovery && !this.pendingLocal.has(path));
+        if (canDelete) {
+          const removed = await this.deleteEmptyFolderIfSafe(folder);
+          if (removed) {
+            await this.pruneEmptyParentFolders(folder);
+          } else if (this.hasSyncableChildren(folder)) {
+            // Folder still has syncable local files — keep it alive and converge back to peers.
+            pending = true;
+            this.pendingLocal.add(path);
+            if (tip?.hlc) tipHlc = tip.hlc;
+          }
+          // Otherwise only ignored/hidden files remain on disk: keep the local folder safe
+          // without resurrecting an empty ghost folder back onto peers.
+        } else {
+          pending = true;
+          this.pendingLocal.add(path);
+          if (tip?.hlc) tipHlc = tip.hlc;
+        }
+      } else {
+        if (unchanged && !exists && this.explicitDeletes.has(path) && !this.pendingDeletes.has(path)) {
+          this.explicitDeletes.delete(path);
+        }
+        const newFolder = !exists && !(existing instanceof TFile) && !this.explicitDeletes.has(path) &&
+          (recovery || !tip || (tip.hash === null && !tip.pending));
+        if (unchanged || newFolder) {
+          if (existing instanceof TFile) {
+            pending = true;
+            if (tip?.hlc) tipHlc = tip.hlc;
+          } else {
+            await this.ensureLocalFolder(folder);
+          }
+        } else if (!exists) {
+          pending = true;
+          if (tip?.hlc) tipHlc = tip.hlc;
+        }
+      }
+    }
+
+    if (pending) this.pendingLocal.add(path);
+    const prevHashes = buildPrevHashes(recovery ? null : tip, op.blobHash, op.prevHash);
+    const result: PathTip = {
+      hash: op.blobHash,
+      vv,
+      ...(tipHlc ? { hlc: tipHlc } : {}),
+      ...(pending ? { pending: true } : isHash(op.prevHash) ? { prevHash: op.prevHash } : {}),
+      ...(prevHashes ? { prevHashes } : {}),
     };
     this.setPathTip(path, result);
     progress.applied++;
@@ -1148,6 +1351,25 @@ export class FlockSyncEngine {
     return cd.length > 0 && (path === cd || path.startsWith(cd + "/"));
   }
 
+  private get folderMarkerPrefix(): string {
+    return `${this.configDir}/${FOLDER_MARKER_DIR}/`;
+  }
+
+  private folderMarkerPath(folderPath: string): string {
+    return `${this.folderMarkerPrefix}${normalizeVaultPath(folderPath)}`;
+  }
+
+  private folderPathFromMarker(path: string): string | null {
+    const prefix = this.folderMarkerPrefix;
+    if (!path.startsWith(prefix)) return null;
+    const folder = path.slice(prefix.length);
+    return folder && isSyncPath(folder) ? folder : null;
+  }
+
+  private isFolderMarkerPath(path: string): boolean {
+    return this.folderPathFromMarker(path) !== null;
+  }
+
   private refreshIgnore(data: PluginData): void {
     if (data.ignorePatterns !== this.ignoreRaw) {
       this.ignoreRaw = data.ignorePatterns;
@@ -1261,6 +1483,11 @@ export class FlockSyncEngine {
 
   private async localKind(path: string): Promise<"file" | "folder" | null> {
     this.assertRunContext();
+    const folder = this.folderPathFromMarker(path);
+    if (folder !== null) {
+      const f = this.app.vault.getAbstractFileByPath(folder);
+      return f instanceof TFolder ? "file" : null;
+    }
     if (this.isConfigPath(path)) {
       const stat = await this.app.vault.adapter.stat(path);
       this.assertRunContext();
@@ -1272,6 +1499,11 @@ export class FlockSyncEngine {
 
   private async readLocalBytes(path: string): Promise<Uint8Array | null> {
     this.assertRunContext();
+    const folder = this.folderPathFromMarker(path);
+    if (folder !== null) {
+      const f = this.app.vault.getAbstractFileByPath(folder);
+      return f instanceof TFolder ? FOLDER_MARKER_BYTES : null;
+    }
     if (this.isConfigPath(path)) {
       const kind = await this.localKind(path);
       if (kind === null) return null;
@@ -1297,6 +1529,12 @@ export class FlockSyncEngine {
   }
 
   private async hashLocalPath(path: string, flush = true): Promise<string | null> {
+    const folder = this.folderPathFromMarker(path);
+    if (folder !== null) {
+      this.assertRunContext();
+      const f = this.app.vault.getAbstractFileByPath(folder);
+      return f instanceof TFolder ? FOLDER_MARKER_HASH : null;
+    }
     if (flush && !this.isConfigPath(path)) await this.flushOpenEditors(path);
     const bytes = await this.readLocalBytes(path);
     const hash = bytes ? await sha256Hex(bytes) : null;
@@ -1456,7 +1694,11 @@ export class FlockSyncEngine {
     if (!isSyncPath(path)) throw new Error("Unsafe file delete path");
     if (await this.hashLocalPath(path) !== expectedHash) throw new CatchUpNeeded(`Local file changed during sync: ${path}`);
     if (this.isConfigPath(path)) {
-      if (await this.localKind(path) === "file") await this.app.vault.adapter.remove(path);
+      if (await this.localKind(path) === "file") {
+        await this.app.vault.adapter.remove(path);
+        this.assertRunContext();
+        await this.pruneEmptyParentFolders(path);
+      }
       this.assertRunContext();
       return;
     }
@@ -1469,9 +1711,80 @@ export class FlockSyncEngine {
       } finally {
         this.deletingRemotePaths.delete(path);
       }
+      this.fileStatCache.delete(path);
+      await this.pruneEmptyParentFolders(path);
+    } else {
+      this.fileStatCache.delete(path);
     }
-    this.fileStatCache.delete(path);
     this.assertRunContext();
+  }
+
+  /** Delete a vault folder ONLY if it is genuinely empty on disk (including hidden/unindexed files). */
+  private async deleteEmptyFolderIfSafe(folderPath: string): Promise<boolean> {
+    this.assertRunContext();
+    const dir = normalizeVaultPath(folderPath);
+    if (!dir || !isSyncPath(dir) || this.isConfigPath(dir) || this.shouldIgnore(dir)) return false;
+    const folder = this.app.vault.getAbstractFileByPath(dir);
+    if (!(folder instanceof TFolder)) return false;
+    if (Array.isArray((folder as { children?: unknown[] }).children) &&
+      (folder as { children: unknown[] }).children.length > 0) {
+      return false;
+    }
+    try {
+      const listing = await this.app.vault.adapter.list(dir);
+      this.assertRunContext();
+      if (listing.files.length > 0 || listing.folders.length > 0) return false;
+    } catch {
+      return false;
+    }
+    this.deletingRemotePaths.add(dir);
+    try {
+      await this.app.vault.delete(folder);
+    } finally {
+      this.deletingRemotePaths.delete(dir);
+    }
+    this.assertRunContext();
+    return true;
+  }
+
+  /**
+   * After a remote delete removes a file or folder, remove any empty ancestor folders
+   * that do not have an active remote folder marker keeping them alive.
+   */
+  private async pruneEmptyParentFolders(deletedPath: string): Promise<void> {
+    let dir = dirname(deletedPath);
+    while (dir) {
+      this.assertRunContext();
+      if (!isSyncPath(dir)) break;
+      if (this.isConfigPath(dir)) {
+        if (dir === this.configDir) break;
+        try {
+          const listing = await this.app.vault.adapter.list(dir);
+          this.assertRunContext();
+          if (listing.files.length > 0 || listing.folders.length > 0) break;
+          if (typeof this.app.vault.adapter.rmdir === "function") {
+            await this.app.vault.adapter.rmdir(dir, false);
+            this.assertRunContext();
+          } else {
+            break;
+          }
+        } catch {
+          break;
+        }
+        dir = dirname(dir);
+        continue;
+      }
+      if (this.shouldIgnore(dir)) break;
+      const marker = this.folderMarkerPath(dir);
+      const markerTip = this.pathTip(marker);
+      if (markerTip && markerTip.hash !== null && !markerTip.pending) break;
+      const removed = await this.deleteEmptyFolderIfSafe(dir);
+      if (!removed) break;
+      if (markerTip && markerTip.hash === null) {
+        this.pendingLocal.delete(marker);
+      }
+      dir = dirname(dir);
+    }
   }
 
   private async ensureLocalFolder(folderPath: string): Promise<void> {
@@ -1484,10 +1797,63 @@ export class FlockSyncEngine {
       const existing = this.app.vault.getAbstractFileByPath(cur);
       if (existing instanceof TFile) throw new Error(`Expected a folder, found a file: ${cur}`);
       if (!existing) {
-        await this.app.vault.createFolder(cur);
+        this.writingRemotePaths.add(cur);
+        try {
+          await this.app.vault.createFolder(cur);
+        } finally {
+          this.writingRemotePaths.delete(cur);
+        }
         this.assertRunContext();
       }
     }
+  }
+
+  private hasSyncableChildren(folderPath: string): boolean {
+    const prefix = `${normalizeVaultPath(folderPath)}/`;
+    for (const file of this.app.vault.getFiles()) {
+      const p = normalizeVaultPath(file.path);
+      if (p.startsWith(prefix) && this.canSync(p)) return true;
+    }
+    return false;
+  }
+
+  private async isFolderEmptyOnDisk(folderPath: string): Promise<boolean> {
+    try {
+      const listing = await this.app.vault.adapter.list(folderPath);
+      this.assertRunContext();
+      return listing.files.length === 0 && listing.folders.length === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  private listLocalFolders(): string[] {
+    const vault = this.app.vault as App["vault"] & {
+      getAllFolders?: (includeRoot?: boolean) => TFolder[];
+      getAllLoadedFiles?: () => TAbstractFile[];
+    };
+    const out = new Set<string>();
+    const addFolder = (raw: string) => {
+      const p = normalizeVaultPath(raw);
+      if (!p || this.isConfigPath(p) || this.shouldIgnore(p) || !isSyncPath(p)) return;
+      out.add(p);
+    };
+    if (typeof vault.getAllFolders === "function") {
+      for (const folder of vault.getAllFolders(false)) addFolder(folder.path);
+    } else if (typeof vault.getAllLoadedFiles === "function") {
+      for (const item of vault.getAllLoadedFiles()) {
+        if (item instanceof TFolder) addFolder(item.path);
+      }
+    } else {
+      for (const file of this.app.vault.getFiles()) {
+        let dir = dirname(file.path);
+        while (dir) {
+          addFolder(dir);
+          dir = dirname(dir);
+        }
+      }
+    }
+    return [...out];
   }
 
   private async ensureAdapterFolder(dir: string): Promise<void> {
@@ -1565,6 +1931,7 @@ export class FlockSyncEngine {
     }
     if (full) {
       for (const file of this.app.vault.getFiles()) paths.add(normalizeVaultPath(file.path));
+      for (const folder of this.listLocalFolders()) paths.add(this.folderMarkerPath(folder));
     }
     if (!paths.size) return;
     const openEditors = this.getOpenEditorPaths();
@@ -1631,6 +1998,20 @@ export class FlockSyncEngine {
         else this.pendingDeletes.delete(path);
       } else {
         this.pendingDeletes.delete(path);
+        const markerFolder = this.folderPathFromMarker(path);
+        if (
+          markerFolder !== null &&
+          tip &&
+          tip.hash === null &&
+          !tip.pending &&
+          !this.pendingLocal.has(path) &&
+          !this.hasSyncableChildren(markerFolder) &&
+          !(await this.isFolderEmptyOnDisk(markerFolder))
+        ) {
+          // Folder survived a remote tombstone only because of local ignored/hidden files;
+          // do not resurrect an empty ghost folder on peers.
+          continue;
+        }
         if (!tip || tip.hash !== hash || tip.pending) this.pendingLocal.add(path);
         else this.pendingLocal.delete(path);
       }
@@ -1640,7 +2021,16 @@ export class FlockSyncEngine {
   private async pushLocalChanges(ctx: OpCtx, progress: SyncProgress): Promise<void> {
     ctx.assertCurrent();
     const prepared: PreparedOp[] = [];
-    for (const path of [...this.pendingDeletes]) {
+    // Order deletes: regular files first, then folder markers deepest-first so peers
+    // always empty a folder before applying its folder tombstone.
+    const orderedDeletes = [...this.pendingDeletes].sort((a, b) => {
+      const aFolder = this.folderPathFromMarker(a);
+      const bFolder = this.folderPathFromMarker(b);
+      if ((aFolder !== null) !== (bFolder !== null)) return aFolder !== null ? 1 : -1;
+      if (aFolder !== null && bFolder !== null) return pathDepth(bFolder) - pathDepth(aFolder);
+      return a.localeCompare(b);
+    });
+    for (const path of orderedDeletes) {
       const revision = this.pathRevisions.get(path) ?? 0;
       const tip = this.pathTip(path);
       if (!this.canSync(path) || !tip || (tip.hash === null && !tip.pending)) {
@@ -1663,7 +2053,15 @@ export class FlockSyncEngine {
       revision: number;
     }> = [];
     const openEditors = this.pendingLocal.size ? this.getOpenEditorPaths() : new Set<string>();
-    for (const path of [...this.pendingLocal]) {
+    // Order creates/writes: parent folder markers first (shallowest-first), then files.
+    const orderedWrites = [...this.pendingLocal].sort((a, b) => {
+      const aFolder = this.folderPathFromMarker(a);
+      const bFolder = this.folderPathFromMarker(b);
+      if ((aFolder !== null) !== (bFolder !== null)) return aFolder !== null ? -1 : 1;
+      if (aFolder !== null && bFolder !== null) return pathDepth(aFolder) - pathDepth(bFolder);
+      return a.localeCompare(b);
+    });
+    for (const path of orderedWrites) {
       if (!this.canSync(path)) { this.pendingLocal.delete(path); continue; }
       if (!this.isConfigPath(path) && openEditors.has(path)) await this.flushOpenEditors(path);
       const revision = this.pathRevisions.get(path) ?? 0;
@@ -1883,6 +2281,10 @@ async function runPool<T>(
   });
   await Promise.all(runners);
   if (failed) throw firstError;
+}
+
+function pathDepth(path: string): number {
+  return path ? path.split("/").length : 0;
 }
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
