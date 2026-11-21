@@ -25,6 +25,8 @@ export class MemoryVault {
   writes = [];
   externalMutations = [];
   beforeNextRead = null;
+  eisdirOnNonForceFolderDelete = false;
+  onNonForceFolderDelete = null;
   clock = 1;
 
   constructor(initial = {}) {
@@ -41,6 +43,11 @@ export class MemoryVault {
       mkdir: async (path) => { this.addFolder(path); },
       rmdir: async (path, recursive = false) => {
         const norm = normalizePath(path);
+        if (!recursive && this.eisdirOnNonForceFolderDelete) {
+          const err = new Error(`Path is a directory: rm returned EISDIR (is a directory) ${norm}`);
+          err.code = "ERR_FS_EISDIR";
+          throw err;
+        }
         const prefix = `${norm}/`;
         const hasChildren = [...this.files.keys()].some((k) => k.startsWith(prefix)) ||
           [...this.folders.keys()].some((k) => k.startsWith(prefix));
@@ -201,10 +208,16 @@ export class MemoryVault {
       this.emit("rename", file, oldPath);
     }
   }
-  async delete(file) {
+  async delete(file, force = false) {
     this.maybeFail("delete", file.path);
     this.auditMutation("delete", file.path);
     if (file instanceof TFolder) {
+      if (!force && this.eisdirOnNonForceFolderDelete) {
+        if (this.onNonForceFolderDelete) await this.onNonForceFolderDelete(file);
+        const err = new Error(`Path is a directory: rm returned EISDIR (is a directory) ${file.path}`);
+        err.code = "ERR_FS_EISDIR";
+        throw err;
+      }
       // Deleting a folder in Obsidian removes its descendants, not just an index entry.
       for (const path of this.files.keys()) if (path.startsWith(`${file.path}/`)) this.files.delete(path);
       for (const path of this.folders.keys()) {

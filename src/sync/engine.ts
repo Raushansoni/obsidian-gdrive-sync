@@ -1724,22 +1724,37 @@ export class FlockSyncEngine {
     this.assertRunContext();
     const dir = normalizeVaultPath(folderPath);
     if (!dir || !isSyncPath(dir) || this.isConfigPath(dir) || this.shouldIgnore(dir)) return false;
-    const folder = this.app.vault.getAbstractFileByPath(dir);
-    if (!(folder instanceof TFolder)) return false;
-    if (Array.isArray((folder as { children?: unknown[] }).children) &&
-      (folder as { children: unknown[] }).children.length > 0) {
-      return false;
-    }
-    try {
-      const listing = await this.app.vault.adapter.list(dir);
-      this.assertRunContext();
-      if (listing.files.length > 0 || listing.folders.length > 0) return false;
-    } catch {
-      return false;
-    }
+    const isEmptyNow = async (): Promise<TFolder | null> => {
+      const candidate = this.app.vault.getAbstractFileByPath(dir);
+      if (!(candidate instanceof TFolder)) return null;
+      if (Array.isArray((candidate as { children?: unknown[] }).children) &&
+        (candidate as { children: unknown[] }).children.length > 0) {
+        return null;
+      }
+      try {
+        const listing = await this.app.vault.adapter.list(dir);
+        this.assertRunContext();
+        if (listing.files.length > 0 || listing.folders.length > 0) return null;
+      } catch {
+        return null;
+      }
+      return candidate;
+    };
+    const folder = await isEmptyNow();
+    if (!folder) return false;
     this.deletingRemotePaths.add(dir);
     try {
-      await this.app.vault.delete(folder);
+      try {
+        await this.app.vault.delete(folder);
+      } catch (error) {
+        if (!isEisdirError(error)) throw error;
+        // Obsidian 1.15+ desktop adapter calls fs.rm(path, { recursive: false }) when
+        // force is false, which fails with ERR_FS_EISDIR even on empty directories.
+        // Re-verify the directory is still empty on disk before retrying with force=true.
+        const stillEmpty = await isEmptyNow();
+        if (!stillEmpty) return false;
+        await this.app.vault.delete(stillEmpty, true);
+      }
     } finally {
       this.deletingRemotePaths.delete(dir);
     }
@@ -1763,7 +1778,15 @@ export class FlockSyncEngine {
           this.assertRunContext();
           if (listing.files.length > 0 || listing.folders.length > 0) break;
           if (typeof this.app.vault.adapter.rmdir === "function") {
-            await this.app.vault.adapter.rmdir(dir, false);
+            try {
+              await this.app.vault.adapter.rmdir(dir, false);
+            } catch (error) {
+              if (!isEisdirError(error)) throw error;
+              const recheck = await this.app.vault.adapter.list(dir);
+              this.assertRunContext();
+              if (recheck.files.length > 0 || recheck.folders.length > 0) break;
+              await this.app.vault.adapter.rmdir(dir, true);
+            }
             this.assertRunContext();
           } else {
             break;
@@ -2285,6 +2308,14 @@ async function runPool<T>(
 
 function pathDepth(path: string): number {
   return path ? path.split("/").length : 0;
+}
+
+function isEisdirError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = (error as { code?: unknown }).code;
+  if (code === "EISDIR" || code === "ERR_FS_EISDIR") return true;
+  const message = (error as { message?: unknown }).message;
+  return typeof message === "string" && /\b(?:ERR_FS_)?EISDIR\b|is a directory/i.test(message);
 }
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {

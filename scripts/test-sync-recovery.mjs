@@ -1291,6 +1291,53 @@ test("folder-ignored-file-safety: remote folder delete refuses to erase a folder
   equal(pc.vault.getAbstractFileByPath("Archive"), null, "Ignored local file does not resurrect ghost folder on PC");
 });
 
+// Obsidian 1.15+ desktop compatibility: vault.delete(folder) without force=true throws ERR_FS_EISDIR.
+test("folder-delete-eisdir-obsidian-115: EISDIR on non-force folder delete retries safely with force=true only when still empty", async () => {
+  const relay = await new TestRelay().init();
+  const pc = await device(relay, {
+    "new project/club app/club app.md": "hello\n",
+    ".obsidian/snippets/custom/theme.css": "body {}\n",
+  });
+  const phone = await device(relay);
+  await pc.sync();
+  await phone.sync();
+
+  // Simulate Obsidian 1.15.1 desktop adapter throwing ERR_FS_EISDIR on non-force rmdir/delete.
+  pc.vault.eisdirOnNonForceFolderDelete = true;
+
+  // 1. Remote delete of folder tree + config file removes empty folders cleanly without EISDIR error.
+  await phone.vault.delete(phone.vault.getAbstractFileByPath("new project"));
+  await phone.vault.adapter.remove(".obsidian/snippets/custom/theme.css");
+  await phone.sync({ full: true });
+  await pc.sync({ full: true });
+
+  equal(pc.status.state, "synced", "Sync reaches synced without EISDIR error");
+  equal(pc.vault.text("new project/club app/club app.md"), null, "Deleted note removed on PC");
+  equal(pc.vault.getAbstractFileByPath("new project/club app"), null, "Empty child folder deleted via force=true fallback");
+  equal(pc.vault.getAbstractFileByPath("new project"), null, "Empty parent folder deleted via force=true fallback");
+  equal(pc.vault.folders.has(".obsidian/snippets/custom"), false, "Empty config subfolder pruned via recursive=true fallback");
+
+  // 2. Safety check: if a new file races into the folder right before the force=true retry,
+  // re-verification MUST abort the force delete and preserve the new file.
+  await phone.vault.createFolder("RaceDir");
+  phone.vault.edit("RaceDir/old.md", "old\n");
+  await phone.sync({ full: false });
+  await pc.sync({ full: false });
+
+  pc.vault.onNonForceFolderDelete = (folder) => {
+    if (folder.path === "RaceDir") {
+      pc.vault.store("RaceDir/raced-in.md", "do not delete me\n");
+    }
+  };
+  await phone.vault.delete(phone.vault.getAbstractFileByPath("RaceDir"));
+  await phone.sync({ full: false });
+  await pc.sync({ full: false });
+
+  equal(pc.vault.text("RaceDir/old.md"), null, "Old file removed");
+  equal(pc.vault.text("RaceDir/raced-in.md"), "do not delete me\n", "File created right before force retry is NEVER deleted");
+  ok(pc.vault.getAbstractFileByPath("RaceDir"), "Folder containing raced-in file stays alive");
+});
+
 try {
   const outfile = path.join(tmp, "production.mjs");
   await esbuild.build({
